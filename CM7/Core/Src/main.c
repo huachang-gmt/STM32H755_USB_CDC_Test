@@ -169,6 +169,7 @@ Error_Handler();
 
     /* USER CODE BEGIN 3 */
 
+    USB_Packet_CheckRxTimeout();
 
 
   }

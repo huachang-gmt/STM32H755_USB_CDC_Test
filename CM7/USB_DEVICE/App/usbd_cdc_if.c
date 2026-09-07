@@ -23,16 +23,14 @@
 
 /* USER CODE BEGIN INCLUDE */
 #include <string.h>
+#include <stdbool.h>
+#include <stdio.h>
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 /* Private macro -------------------------------------------------------------*/
 
-/* USER CODE BEGIN PV */
-/* Private variables ---------------------------------------------------------*/
-
-/* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
   * @brief Usb device library.
@@ -62,7 +60,36 @@
   */
 
 /* USER CODE BEGIN PRIVATE_DEFINES */
+
+#define USB_PKT_MAGIC0              0x47U
+#define USB_PKT_MAGIC1              0x4DU
+#define USB_PKT_VERSION             0x01U
+
+#define USB_PKT_TYPE_COMMAND        0x01U
+#define USB_PKT_TYPE_RESPONSE       0x02U
+#define USB_PKT_TYPE_ACK            0x03U
+#define USB_PKT_TYPE_RETRANSMIT_REQUEST 0x04U
+
+#define USB_PKT_HEADER_SIZE         8U
+#define USB_PKT_CRC_SIZE            2U
+#define USB_PKT_MAX_PAYLOAD         4096U
+#define USB_PKT_MAX_SIZE            \
+    (USB_PKT_HEADER_SIZE + USB_PKT_MAX_PAYLOAD + USB_PKT_CRC_SIZE)
+
+/*已經開始收到一個封包，但 100 ms 內仍沒有收完整，就視為接收 timeout*/   
+#define USB_PKT_RX_TIMEOUT_MS          100U
 /* USER CODE END PRIVATE_DEFINES */
+
+
+/* USER CODE BEGIN PV */
+/* Private variables ---------------------------------------------------------*/
+
+static uint8_t packet_rx_buffer[USB_PKT_MAX_SIZE];
+static uint32_t packet_rx_length = 0U;
+static uint32_t packet_rx_start_tick = 0U;
+static uint16_t packet_rx_sequence = 0U;
+/* USER CODE END PV */
+
 
 /**
   * @}
@@ -128,7 +155,11 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
+static void USB_Packet_ProcessRx(void);
 
+static void USB_Packet_SendResponse(
+    uint16_t sequence,
+    uint16_t payload_length);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -262,10 +293,6 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
 
-  static char command_buffer[128];
-  static uint32_t command_length = 0U;
-
-
   printf("[USB RX] Len=%lu\r\n", *Len);
 
   printf("[USB RX] Data HEX:");
@@ -277,68 +304,51 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 
   printf("\r\n");
 
-  for (uint32_t i = 0U; i < *Len; i++)
+  /*
+   * USB CDC is a byte stream.
+   *
+   * One callback does NOT necessarily equal one packet.
+   *
+   * Append the received bytes into the packet accumulator.
+   */
+  if ((*Len > 0U) &&
+      ((packet_rx_length + *Len) <= USB_PKT_MAX_SIZE))
   {
-    char ch = (char)Buf[i];
-
-    /*
-     * Prevent command buffer overflow.
-     */
-    if (command_length < (sizeof(command_buffer) - 1U))
+    if (packet_rx_length == 0U)
     {
-      command_buffer[command_length++] = ch;
-      command_buffer[command_length] = '\0';
-    }
-    else
-    {
-      command_length = 0U;
+        packet_rx_start_tick = HAL_GetTick();
     }
 
-    /*
-     * A complete command ends with CRLF.
-     */
-    if ((command_length >= 2U) &&
-        (command_buffer[command_length - 2U] == '\r') &&
-        (command_buffer[command_length - 1U] == '\n'))
+    memcpy(
+        &packet_rx_buffer[packet_rx_length],
+        Buf,
+        *Len
+    );
+
+    packet_rx_length += *Len;
+
+    USB_Packet_ProcessRx();
+
+    if (packet_rx_length == 0U)
     {
-      static const char expected_command[] =
-          "MOV R 1000 1000 500 0 0 0";
-
-      const uint32_t expected_length =
-          sizeof(expected_command) - 1U;
-
-      printf("[USB RX] CRLF detected, command_length=%lu\r\n", command_length);
-
-      printf("[USB RX] expected_length=%lu, received_command_length=%lu\r\n", expected_length, command_length - 2U);
-
-      /*
-       * Compare command excluding CRLF.
-       */
-      if ((command_length - 2U == expected_length) &&
-          (memcmp(command_buffer,
-                  expected_command,
-                  expected_length) == 0))
-      {
-        uint8_t response[] = "DONE\r\n";
-
-        CDC_Transmit_FS(
-            response,
-            sizeof(response) - 1U
-        );
-      }
-      else
-      {
-        printf("[USB RX] Command NOT MATCH\r\n");
-      }
-
-      /*
-       * Command has been processed.
-       * Prepare for the next command.
-       */
-      command_length = 0U;
+        packet_rx_start_tick = 0U;
     }
+
   }
+  else
+  {
+    printf(
+        "[USB PKT] RX accumulator overflow\r\n"
+    );
 
+    /*
+     * For now reset the accumulator.
+     *
+     * Later this condition will be handled by the
+     * transport reliability/error mechanism.
+     */
+    packet_rx_length = 0U;
+  }
 
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
@@ -395,6 +405,616 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+
+static uint16_t USB_Packet_CalculateCRC16(
+    const uint8_t *data,
+    uint32_t length)
+{
+    const uint16_t polynomial = 0xA001U;
+    uint16_t crc = 0xFFFFU;
+
+    for (uint32_t i = 0U; i < length; i++)
+    {
+        crc ^= data[i];
+
+        for (uint32_t bit = 0U; bit < 8U; bit++)
+        {
+            if ((crc & 0x0001U) != 0U)
+            {
+                crc = (uint16_t)((crc >> 1U) ^ polynomial);
+            }
+            else
+            {
+                crc >>= 1U;
+            }
+        }
+    }
+
+    return crc;
+}
+
+static uint16_t USB_Packet_ReadUint16LE(
+    const uint8_t *data)
+{
+    return (uint16_t)(
+        (uint16_t)data[0] |
+        ((uint16_t)data[1] << 8U)
+    );
+}
+
+static void USB_Packet_SendResponse(
+    uint16_t sequence,
+    uint16_t payload_length)
+{
+    static uint8_t packet[128];
+    uint32_t packet_length = 0U;
+
+    char response_payload[64];
+
+    const int response_length = snprintf(
+        response_payload,
+        sizeof(response_payload),
+        "RX OK SEQ=%u LEN=%u\r\n",
+        sequence,
+        payload_length
+    );
+
+    if (response_length <= 0)
+    {
+        return;
+    }
+
+    if ((uint32_t)response_length > 64U)
+    {
+        return;
+    }
+
+    /*
+     * ------------------------------------------------------------
+     * Transport Header
+     *
+     * Byte 0~1 : Magic
+     * Byte 2   : Version
+     * Byte 3   : RESPONSE
+     * Byte 4~5 : Sequence
+     * Byte 6~7 : Payload Length
+     * ------------------------------------------------------------
+     */
+
+    packet[0] = USB_PKT_MAGIC0;
+    packet[1] = USB_PKT_MAGIC1;
+    packet[2] = USB_PKT_VERSION;
+    packet[3] = USB_PKT_TYPE_RESPONSE;
+
+    packet[4] = (uint8_t)(sequence & 0x00FFU);
+    packet[5] = (uint8_t)((sequence >> 8U) & 0x00FFU);
+
+    packet[6] = (uint8_t)(
+        (uint16_t)response_length & 0x00FFU
+    );
+
+    packet[7] = (uint8_t)(
+        ((uint16_t)response_length >> 8U) & 0x00FFU
+    );
+
+    /*
+     * Payload
+     */
+    memcpy(
+        &packet[USB_PKT_HEADER_SIZE],
+        response_payload,
+        (uint32_t)response_length
+    );
+
+    packet_length =
+        USB_PKT_HEADER_SIZE +
+        (uint32_t)response_length;
+
+    /*
+     * CRC covers Header + Payload.
+     */
+    const uint16_t crc =
+        USB_Packet_CalculateCRC16(
+            packet,
+            packet_length
+        );
+
+    packet[packet_length++] =
+        (uint8_t)(crc & 0x00FFU);
+
+    packet[packet_length++] =
+        (uint8_t)((crc >> 8U) & 0x00FFU);
+
+    printf(
+        "[USB PKT TX] RESPONSE seq=%u payload=%u total=%lu\r\n",
+        sequence,
+        (uint16_t)response_length,
+        packet_length
+    );
+
+    printf("[USB PKT TX] HEX:");
+
+    for (uint32_t i = 0U; i < packet_length; i++)
+    {
+        printf(
+            " %02X",
+            packet[i]
+        );
+    }
+
+    printf("\r\n");
+
+    const uint8_t result =
+        CDC_Transmit_FS(
+            packet,
+            (uint16_t)packet_length
+        );
+
+    printf(
+        "[USB PKT TX] CDC_Transmit_FS result=%u\r\n",
+        result
+    );
+}
+
+static void USB_Packet_SendRetransmitRequest(uint16_t sequence)
+{
+    static uint8_t packet[12];
+    uint32_t packet_length = 0U;
+
+    /*
+     * RETRANSMIT_REQUEST Packet
+     *
+     * Byte 0~1 : Magic
+     * Byte 2   : Version
+     * Byte 3   : RETRANSMIT_REQUEST
+     * Byte 4~5 : Sequence
+     * Byte 6~7 : Payload Length = 2
+     * Byte 8~9 : Requested Sequence
+     * Byte 10~11 : CRC16
+     */
+
+    packet[0] = USB_PKT_MAGIC0;
+    packet[1] = USB_PKT_MAGIC1;
+    packet[2] = USB_PKT_VERSION;
+    packet[3] = USB_PKT_TYPE_RETRANSMIT_REQUEST;
+
+    /* Transport Header Sequence */
+    packet[4] = (uint8_t)(sequence & 0x00FFU);
+    packet[5] = (uint8_t)((sequence >> 8U) & 0x00FFU);
+
+    /* Payload Length = 2 */
+    packet[6] = 0x02U;
+    packet[7] = 0x00U;
+
+    /* Payload = requested sequence */
+    packet[8] = (uint8_t)(sequence & 0x00FFU);
+    packet[9] = (uint8_t)((sequence >> 8U) & 0x00FFU);
+
+    packet_length = 10U;
+
+    const uint16_t crc =
+        USB_Packet_CalculateCRC16(
+            packet,
+            packet_length
+        );
+
+    packet[packet_length++] =
+        (uint8_t)(crc & 0x00FFU);
+
+    packet[packet_length++] =
+        (uint8_t)((crc >> 8U) & 0x00FFU);
+
+    printf(
+        "[USB PKT TX] RETRANSMIT_REQUEST seq=%u total=%lu\r\n",
+        sequence,
+        packet_length
+    );
+
+    printf("[USB PKT TX] HEX:");
+
+    for (uint32_t i = 0U; i < packet_length; i++)
+    {
+        printf(
+            " %02X",
+            packet[i]
+        );
+    }
+
+    printf("\r\n");
+
+    const uint8_t result =
+        CDC_Transmit_FS(
+            packet,
+            (uint16_t)packet_length
+        );
+
+    printf(
+        "[USB PKT TX] CDC_Transmit_FS result=%u\r\n",
+        result
+    );
+}
+
+static void USB_Packet_ProcessRx(void)
+{
+    while (true)
+    {
+        /*
+         * ------------------------------------------------------------
+         * 1. Need at least 2 bytes to search for packet magic.
+         * ------------------------------------------------------------
+         */
+        if (packet_rx_length < 2U)
+        {
+            return;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 2. Synchronize to MAGIC = 0x47 0x4D.
+         *
+         * Any bytes before MAGIC are discarded.
+         * ------------------------------------------------------------
+         */
+        uint32_t magic_index = 0U;
+
+        while (magic_index + 1U < packet_rx_length)
+        {
+            if ((packet_rx_buffer[magic_index] == USB_PKT_MAGIC0) &&
+                (packet_rx_buffer[magic_index + 1U] == USB_PKT_MAGIC1))
+            {
+                break;
+            }
+
+            magic_index++;
+        }
+
+        /*
+         * No complete MAGIC pair found yet.
+         *
+         * Keep the last byte because it could be 0x47
+         * and the next USB callback may contain 0x4D.
+         */
+        if (magic_index + 1U >= packet_rx_length)
+        {
+            if (packet_rx_buffer[packet_rx_length - 1U] ==
+                USB_PKT_MAGIC0)
+            {
+                packet_rx_buffer[0] =
+                    USB_PKT_MAGIC0;
+
+                packet_rx_length = 1U;
+            }
+            else
+            {
+                packet_rx_length = 0U;
+            }
+
+            return;
+        }
+
+        /*
+         * Discard bytes before MAGIC.
+         */
+        if (magic_index > 0U)
+        {
+            memmove(
+                packet_rx_buffer,
+                &packet_rx_buffer[magic_index],
+                packet_rx_length - magic_index
+            );
+
+            packet_rx_length -= magic_index;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 3. Need complete 8-byte header.
+         *
+         * IMPORTANT:
+         * Receiving only part of the header is NOT an error.
+         * We simply wait for the next CDC callback.
+         * ------------------------------------------------------------
+         */
+        if (packet_rx_length < USB_PKT_HEADER_SIZE)
+        {
+            printf(
+                "[USB PKT] Fragment: header %lu/%u bytes\r\n",
+                packet_rx_length,
+                USB_PKT_HEADER_SIZE
+            );
+
+            return;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 4. Check protocol version.
+         * ------------------------------------------------------------
+         */
+        if (packet_rx_buffer[2] != USB_PKT_VERSION)
+        {
+            printf(
+                "[USB PKT] Invalid version: 0x%02X\r\n",
+                packet_rx_buffer[2]
+            );
+
+            /*
+             * Discard current MAGIC and try to resynchronize.
+             */
+            memmove(
+                packet_rx_buffer,
+                &packet_rx_buffer[1],
+                packet_rx_length - 1U
+            );
+
+            packet_rx_length--;
+
+            continue;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 5. Check packet type.
+         * ------------------------------------------------------------
+         */
+        const uint8_t packet_type =
+            packet_rx_buffer[3];
+
+        if ((packet_type != USB_PKT_TYPE_COMMAND) &&
+            (packet_type != USB_PKT_TYPE_RESPONSE) &&
+            (packet_type != USB_PKT_TYPE_ACK) &&
+            (packet_type != USB_PKT_TYPE_RETRANSMIT_REQUEST))
+        {
+            printf(
+                "[USB PKT] Invalid type: 0x%02X\r\n",
+                packet_type
+            );
+
+            /*
+             * Discard current MAGIC and resynchronize.
+             */
+            memmove(
+                packet_rx_buffer,
+                &packet_rx_buffer[1],
+                packet_rx_length - 1U
+            );
+
+            packet_rx_length--;
+
+            continue;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 6. Read Sequence and Payload Length.
+         * ------------------------------------------------------------
+         */
+        const uint16_t sequence =
+            USB_Packet_ReadUint16LE(
+                &packet_rx_buffer[4]
+            );
+
+        packet_rx_sequence = sequence;
+
+
+        const uint16_t payload_length =
+            USB_Packet_ReadUint16LE(
+                &packet_rx_buffer[6]
+            );
+
+        /*
+         * ------------------------------------------------------------
+         * 7. Validate payload length.
+         * ------------------------------------------------------------
+         */
+        if (payload_length > USB_PKT_MAX_PAYLOAD)
+        {
+            printf(
+                "[USB PKT] Invalid payload length: %u\r\n",
+                payload_length
+            );
+
+            /*
+             * Discard current MAGIC and resynchronize.
+             */
+            memmove(
+                packet_rx_buffer,
+                &packet_rx_buffer[1],
+                packet_rx_length - 1U
+            );
+
+            packet_rx_length--;
+
+            continue;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 8. Calculate complete packet size.
+         * ------------------------------------------------------------
+         */
+        const uint32_t expected_packet_size =
+            USB_PKT_HEADER_SIZE +
+            (uint32_t)payload_length +
+            USB_PKT_CRC_SIZE;
+
+        /*
+         * ------------------------------------------------------------
+         * 9. Packet is not complete yet.
+         *
+         * THIS IS NORMAL.
+         *
+         * The packet may have been split across multiple
+         * CDC callbacks.
+         * ------------------------------------------------------------
+         */
+        if (packet_rx_length < expected_packet_size)
+        {
+            printf(
+                "[USB PKT] Fragment: %lu/%lu bytes, waiting...\r\n",
+                packet_rx_length,
+                expected_packet_size
+            );
+
+            return;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 10. Full packet received.
+         *     Verify CRC.
+         * ------------------------------------------------------------
+         */
+        const uint16_t received_crc =
+            USB_Packet_ReadUint16LE(
+                &packet_rx_buffer[
+                    USB_PKT_HEADER_SIZE + payload_length
+                ]
+            );
+
+        const uint16_t calculated_crc =
+            USB_Packet_CalculateCRC16(
+                packet_rx_buffer,
+                USB_PKT_HEADER_SIZE + payload_length
+            );
+
+        printf(
+            "[USB PKT] Full packet: type=0x%02X seq=%u payload=%u\r\n",
+            packet_type,
+            sequence,
+            payload_length
+        );
+
+        printf(
+            "[USB PKT] CRC RX=0x%04X CALC=0x%04X\r\n",
+            received_crc,
+            calculated_crc
+        );
+
+        if (received_crc != calculated_crc)
+        {
+            printf(
+                "[USB PKT] CRC ERROR\r\n"
+            );
+
+            /*
+             * For now:
+             * Do NOT implement retransmission yet.
+             *
+             * That will be the next reliability step.
+             */
+
+            memmove(
+                packet_rx_buffer,
+                &packet_rx_buffer[expected_packet_size],
+                packet_rx_length - expected_packet_size
+            );
+
+            packet_rx_length -= expected_packet_size;
+
+            continue;
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 11. CRC OK.
+         * ------------------------------------------------------------
+         */
+        printf(
+            "[USB PKT] CRC OK\r\n"
+        );
+
+        if (packet_type == USB_PKT_TYPE_COMMAND)
+        {
+            printf(
+                "[USB PKT] COMMAND received, seq=%u\r\n",
+                sequence
+            );
+
+            printf(
+                "[USB PKT] Payload HEX:"
+            );
+
+            for (uint16_t i = 0U; i < payload_length; i++)
+            {
+                printf(
+                    " %02X",
+                    packet_rx_buffer[
+                        USB_PKT_HEADER_SIZE + i
+                    ]
+                );
+            }
+
+            printf("\r\n");
+
+            USB_Packet_SendResponse(
+                sequence,
+                payload_length
+            );
+        }
+
+        /*
+         * ------------------------------------------------------------
+         * 12. Remove processed packet.
+         *
+         * If another complete packet already exists in the
+         * accumulator, the while-loop processes it immediately.
+         * ------------------------------------------------------------
+         */
+        memmove(
+            packet_rx_buffer,
+            &packet_rx_buffer[expected_packet_size],
+            packet_rx_length - expected_packet_size
+        );
+
+        packet_rx_length -= expected_packet_size;
+    }
+}
+
+
+void USB_Packet_CheckRxTimeout(void)
+{
+    if (packet_rx_length == 0U)
+    {
+        return;
+    }
+
+    const uint32_t now = HAL_GetTick();
+
+    if ((now - packet_rx_start_tick) >= USB_PKT_RX_TIMEOUT_MS)
+    {
+        printf(
+            "[USB PKT] RX TIMEOUT: received=%lu bytes\r\n",
+            packet_rx_length
+        );
+
+        /*
+         * Only request retransmission when the complete
+         * transport header has been received.
+         *
+         * Before 8 bytes are received, the sequence number
+         * cannot be reliably determined.
+         */
+        if (packet_rx_length >= USB_PKT_HEADER_SIZE)
+        {
+            USB_Packet_SendRetransmitRequest(
+                packet_rx_sequence
+            );
+        }
+        else
+        {
+            printf(
+                "[USB PKT] RX TIMEOUT: header incomplete, "
+                "no retransmit request\r\n"
+            );
+        }
+
+        packet_rx_length = 0U;
+        packet_rx_start_tick = 0U;
+        packet_rx_sequence = 0U;
+
+    }
+}
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
