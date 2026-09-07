@@ -556,6 +556,7 @@ static void USB_Packet_SendResponse(
     );
 }
 
+//「明天 Stage 8 要重新檢查／重寫」
 static void USB_Packet_SendRetransmitRequest(uint16_t sequence)
 {
     static uint8_t packet[12];
@@ -951,6 +952,7 @@ static void USB_Packet_ProcessRx(void)
                 sequence,
                 payload_length
             );
+
         }
 
         /*
@@ -971,48 +973,24 @@ static void USB_Packet_ProcessRx(void)
     }
 }
 
-
+// 讓 Timeout「只丟棄，不要求重傳」
 void USB_Packet_CheckRxTimeout(void)
 {
     if (packet_rx_length == 0U)
-    {
         return;
-    }
 
     const uint32_t now = HAL_GetTick();
 
     if ((now - packet_rx_start_tick) >= USB_PKT_RX_TIMEOUT_MS)
     {
         printf(
-            "[USB PKT] RX TIMEOUT: received=%lu bytes\r\n",
+            "[USB PKT] ERROR: RX TIMEOUT - incomplete packet, received=%lu bytes\r\n",
             packet_rx_length
         );
-
-        /*
-         * Only request retransmission when the complete
-         * transport header has been received.
-         *
-         * Before 8 bytes are received, the sequence number
-         * cannot be reliably determined.
-         */
-        if (packet_rx_length >= USB_PKT_HEADER_SIZE)
-        {
-            USB_Packet_SendRetransmitRequest(
-                packet_rx_sequence
-            );
-        }
-        else
-        {
-            printf(
-                "[USB PKT] RX TIMEOUT: header incomplete, "
-                "no retransmit request\r\n"
-            );
-        }
 
         packet_rx_length = 0U;
         packet_rx_start_tick = 0U;
         packet_rx_sequence = 0U;
-
     }
 }
 

@@ -2543,3 +2543,987 @@ Fragment 3
 
 ---
 
+### 先確認你現在的狀態
+
+目前已經完成並且 GitHub checkpoint：
+
+**CM5 → USB CDC → STM32H755 → USB CDC → CM5**
+
+雙方都已經具備：
+
+1. **Command Packet 封裝**
+2. **Packet 解封裝**
+3. **Sequence**
+4. **Payload Length**
+5. **CRC16**
+6. **Command 接收**
+7. **Response Packet 封裝**
+8. **Response Packet 解封裝**
+9. **正常完整 Packet 的雙向傳輸**
+
+也就是目前：
+
+> **一次完整送出的 Packet → STM32H755 正確收到 → 解 Packet → 處理 Command → 回傳 Response Packet → CM5 正確解 Packet**
+
+這條路徑已經成立。
+
+---
+# STM32H755 USB CDC Transport
+
+## 1. 專案目的
+
+本專案使用 STM32H755 的 USB OTG FS / USB CDC Device，與 Raspberry Pi CM5 建立雙向 USB CDC ACM 通訊。
+
+系統架構：
+
+```text
+Raspberry Pi CM5
+       │
+       │ USB CDC ACM
+       ▼
+STM32H755
+       │
+       ├── USB CDC
+       │
+       ├── EtherCAT Master
+       │
+       └── Motion Control
+```
+
+STM32 USB：
+
+```text
+USB_OTG_FS
+```
+
+USB Device class：
+
+```text
+CDC ACM
+```
+
+---
+
+# 2. USB Hardware Configuration
+
+目前 STM32H755 使用：
+
+```text
+USB_OTG_FS
+```
+
+主要 GPIO：
+
+```text
+PA8
+PA9
+PA11
+PA12
+```
+
+USB 使用：
+
+```text
+HSI48
+```
+
+USB PHY：
+
+```text
+Embedded PHY
+```
+
+目前：
+
+```text
+VBUS sensing = DISABLE
+DMA = DISABLE
+Speed = Full Speed
+```
+
+這些設定屬於目前已驗證的 USB CDC 基礎環境，不因為分段封包機制而修改。
+
+---
+
+# 3. USB Packet Protocol
+
+STM32 與 CM5 使用相同 Packet Format。
+
+```text
+Byte 0       Magic 0       0x47
+Byte 1       Magic 1       0x4D
+Byte 2       Version       0x01
+Byte 3       Type
+Byte 4       Sequence LSB
+Byte 5       Sequence MSB
+Byte 6       Payload Length LSB
+Byte 7       Payload Length MSB
+Byte 8...    Payload
+最後 2 bytes CRC16
+```
+
+Type：
+
+```text
+0x01 COMMAND
+0x02 RESPONSE
+0x03 ACK
+0x04 RETRANSMIT_REQUEST
+```
+
+CRC：
+
+```text
+Polynomial = 0xA001
+Initial    = 0xFFFF
+```
+
+---
+
+# 4. 為什麼 STM32 必須支援 Fragment RX
+
+USB CDC Receive callback：
+
+```c
+CDC_Receive_FS()
+```
+
+不能假設：
+
+```text
+1 callback = 1 complete packet
+```
+
+例如一個 26-byte Packet 可能收到：
+
+```text
+CDC_Receive_FS()
+    6 bytes
+
+CDC_Receive_FS()
+    10 bytes
+
+CDC_Receive_FS()
+    10 bytes
+```
+
+也可能：
+
+```text
+CDC_Receive_FS()
+    26 bytes
+```
+
+甚至在不同環境下形成其他分段方式。
+
+因此 STM32 必須建立：
+
+```text
+RX accumulator
+```
+
+將多次 USB CDC callback 收到的資料組合成完整 Packet。
+
+---
+
+# 5. RX Accumulator
+
+目前使用：
+
+```c
+static uint8_t packet_rx_buffer[USB_PKT_MAX_SIZE];
+static uint32_t packet_rx_length = 0U;
+static uint32_t packet_rx_start_tick = 0U;
+static uint16_t packet_rx_sequence = 0U;
+```
+
+其中：
+
+```c
+packet_rx_buffer
+```
+
+保存尚未完成的 Packet。
+
+```c
+packet_rx_length
+```
+
+表示目前已收到多少 bytes。
+
+```c
+packet_rx_start_tick
+```
+
+記錄這一筆 incomplete packet 開始接收的時間。
+
+---
+
+# 6. CDC_Receive_FS() 工作流程
+
+正式 `CDC_Receive_FS()` 的流程：
+
+```text
+USB CDC data
+     │
+     ▼
+CDC_Receive_FS()
+     │
+     ▼
+取得 Len
+     │
+     ▼
+若 RX buffer 為空
+     │
+     └── 記錄 packet_rx_start_tick
+     │
+     ▼
+append data
+     │
+     ▼
+packet_rx_length += Len
+     │
+     ▼
+USB_Packet_ProcessRx()
+     │
+     ├── Packet incomplete
+     │       ↓
+     │     等待下一次 callback
+     │
+     └── Packet complete
+             ↓
+          Decode
+             ↓
+           CRC
+             ↓
+        Process command
+```
+
+最後重新啟用：
+
+```c
+USBD_CDC_SetRxBuffer()
+USBD_CDC_ReceivePacket()
+```
+
+確保 USB CDC 可以繼續接收下一筆資料。
+
+---
+
+# 7. Fragment Packet 判斷
+
+收到 Header 後，STM32 取得：
+
+```text
+payload_length
+```
+
+完整 Packet：
+
+```text
+expected_packet_length =
+    8
+    + payload_length
+    + 2
+```
+
+例如：
+
+```text
+Header  = 8
+Payload = 16
+CRC     = 2
+
+Total   = 26
+```
+
+如果：
+
+```text
+packet_rx_length = 16
+expected          = 26
+```
+
+STM32 不會立即判定錯誤。
+
+而是：
+
+```text
+Fragment: 16/26 bytes, waiting...
+```
+
+等待下一次 USB CDC Receive。
+
+---
+
+# 8. STM32 Fragment RX 實際測試
+
+使用 CM5 刻意只傳送：
+
+```text
+26-byte Packet
+```
+
+中的前：
+
+```text
+16 bytes
+```
+
+Packet：
+
+```text
+47 4D 01 01 01 00 10 00
+53 50 49 20 52 20 55 20
+31 30 20 35 20 32 0D 0A
+DF 91
+```
+
+CM5 只傳：
+
+```text
+47 4D 01 01 01 00 10 00
+53 50 49 20 52 20 55 20
+```
+
+STM32 實際輸出：
+
+```text
+[USB RX] Len=16
+
+[USB PKT] Fragment: 16/26 bytes, waiting...
+```
+
+此時：
+
+```text
+16 < 26
+```
+
+所以 Packet 沒有被 Decode。
+
+---
+
+# 9. STM32 RX Timeout
+
+目前正式設定：
+
+```c
+#define USB_PKT_RX_TIMEOUT_MS 100U
+```
+
+Timeout 的意義：
+
+```text
+Packet 已經開始接收
++
+Header 已知
++
+Packet 尚未完整
++
+100 ms 內沒有完成
+```
+
+則：
+
+```text
+RX TIMEOUT
+```
+
+---
+
+# 10. USB_Packet_CheckRxTimeout()
+
+目前 timeout 機制：
+
+```c
+void USB_Packet_CheckRxTimeout(void)
+{
+    if (packet_rx_length == 0U)
+        return;
+
+    const uint32_t now = HAL_GetTick();
+
+    if ((now - packet_rx_start_tick) >= USB_PKT_RX_TIMEOUT_MS)
+    {
+        printf(
+            "[USB PKT] ERROR: RX TIMEOUT - incomplete packet, received=%lu bytes\r\n",
+            packet_rx_length
+        );
+
+        packet_rx_length = 0U;
+        packet_rx_start_tick = 0U;
+        packet_rx_sequence = 0U;
+    }
+}
+```
+
+此函式在 `main()` 的主迴圈中呼叫：
+
+```c
+while (1)
+{
+    USB_Packet_CheckRxTimeout();
+}
+```
+
+因此 timeout 檢查不放在 USB callback 裡等待。
+
+這一點非常重要。
+
+---
+
+# 11. 為什麼 Timeout 不放在 CDC_Receive_FS() 裡等待
+
+錯誤做法：
+
+```text
+CDC_Receive_FS()
+    ↓
+delay 100 ms
+    ↓
+等待下一段資料
+```
+
+這會讓 USB CDC callback 長時間被占用。
+
+正確做法：
+
+```text
+CDC_Receive_FS()
+    ↓
+收到 fragment
+    ↓
+保存資料
+    ↓
+立即返回
+    ↓
+main loop
+    ↓
+USB_Packet_CheckRxTimeout()
+```
+
+這符合 USB CDC 非阻塞接收的設計方向。
+
+---
+
+# 12. STM32 Timeout 測試結果
+
+CM5 傳送：
+
+```text
+16 / 26 bytes
+```
+
+STM32：
+
+```text
+[USB RX] Len=16
+[USB PKT] Fragment: 16/26 bytes, waiting...
+```
+
+等待超過：
+
+```text
+100 ms
+```
+
+STM32：
+
+```text
+[USB PKT] ERROR: RX TIMEOUT - incomplete packet, received=16 bytes
+```
+
+然後：
+
+```text
+packet_rx_length = 0
+packet_rx_start_tick = 0
+packet_rx_sequence = 0
+```
+
+代表這一筆殘缺 Packet 已經被正式丟棄。
+
+---
+
+# 13. STM32 → CM5 Fragment TX 測試
+
+曾經為了驗證另一方向建立過：
+
+```text
+STM32 Fragment TX state machine
+```
+
+原始目的：
+
+```text
+STM32
+  ↓
+故意把 Response Packet 分成多個 fragment
+  ↓
+CM5
+  ↓
+Fragment RX
+```
+
+例如完整 Response：
+
+```text
+30 bytes
+```
+
+故意先傳：
+
+```text
+8 bytes
+```
+
+CM5 收到：
+
+```text
+[USB RX] Len=8
+
+[USB RX] HEX:
+47 4D 01 02 01 00 14 00
+
+[USB RX] Fragment: 8/30 bytes, waiting...
+```
+
+100 ms 後：
+
+```text
+[USB RX] ERROR: RX TIMEOUT - incomplete packet, received=8 bytes
+```
+
+此測試證明：
+
+```text
+STM32 → CM5
+```
+
+方向的：
+
+```text
+Fragment RX
++
+Timeout
+```
+
+運作正確。
+
+---
+
+# 14. Fragment TX State Machine 的重要經驗
+
+最初曾嘗試在：
+
+```c
+CDC_Receive_FS()
+```
+
+裡直接進行 blocking fragment transmission。
+
+此方式會造成 USB CDC completion 無法正常前進，形成 USB 傳輸上的問題。
+
+後來建立：
+
+```text
+non-blocking Fragment TX state machine
+```
+
+讓 fragment transmission 在主流程中逐步進行。
+
+這個測試成功驗證了：
+
+```text
+STM32 可以將 Packet 分段傳送
+```
+
+但此 state machine 本身只是：
+
+```text
+fault / fragmentation test machinery
+```
+
+不是目前正式 USB transport protocol 的必要部分。
+
+因此在 Stage 1～7 驗證完成後，已將：
+
+```text
+USB_Packet_ProcessFragmentTx()
+USB_Packet_SendResponseFragmented()
+fragment TX state
+fragment TX buffer
+```
+
+全部從正式 STM32 程式移除。
+
+這是刻意的 cleanup，不是功能退化。
+
+---
+
+# 15. 正式 STM32 Response
+
+目前正式 Response 使用：
+
+```c
+USB_Packet_SendResponse()
+```
+
+建立：
+
+```text
+RESPONSE Packet
+```
+
+格式：
+
+```text
+Magic
+Version
+Type = RESPONSE
+Sequence
+Payload Length
+Payload
+CRC16
+```
+
+例如：
+
+```text
+RX OK SEQ=1 LEN=16
+```
+
+形成：
+
+```text
+47 4D 01 02
+01 00
+14 00
+52 58 20 4F 4B ...
+CRC
+```
+
+然後：
+
+```c
+CDC_Transmit_FS()
+```
+
+送給 CM5。
+
+---
+
+# 16. CRC 驗證
+
+STM32 收到完整 Packet 後：
+
+```text
+Header + Payload
+        │
+        ▼
+CRC16 Calculate
+        │
+        ├── CALC == RX
+        │      ↓
+        │    CRC OK
+        │
+        └── CALC != RX
+               ↓
+           CRC ERROR
+               ↓
+        丟棄該完整錯誤 Packet
+```
+
+目前 Stage 7 的 CRC error：
+
+```text
+discard
+```
+
+尚未自動要求 retransmission。
+
+Retransmission 是下一階段 Stage 8/9。
+
+---
+
+# 17. Normal E2E 驗證
+
+STM32 已完成正常雙向 Packet E2E 驗證。
+
+例如：
+
+```text
+MOV R 1000 1000 500 0 0 0
+```
+
+STM32：
+
+```text
+Full packet: type=0x01 seq=1 payload=27
+CRC RX=0x5422 CALC=0x5422
+CRC OK
+COMMAND received
+```
+
+並回傳：
+
+```text
+RX OK SEQ=1 LEN=27
+```
+
+另外也驗證：
+
+```text
+SPI R U 10 5 2
+```
+
+與：
+
+```text
+MPV M01 M03 1200.0 -35.5
+```
+
+均成功。
+
+---
+
+# 18. 目前正式程式狀態
+
+STM32 正式 USB transport 已保留：
+
+```text
+USB CDC Device                 DONE
+Packet RX accumulator          DONE
+Fragment RX                    DONE
+Packet length detection        DONE
+CRC16                          DONE
+Normal Response TX             DONE
+RX Timeout                     DONE
+```
+
+目前不再保留：
+
+```text
+Fragment TX test state machine
+Blocking fragment TX
+Temporary timeout TX test
+```
+
+---
+
+# 19. Stage 1～7 完成狀態
+
+目前 USB Transport：
+
+```text
+Stage 1  CM5 Packet Encode/Decode       DONE
+Stage 2  STM32 Packet Parser             DONE
+Stage 3  STM32 Fragment RX               DONE
+Stage 4  CM5 Fragment RX                 DONE
+Stage 5  CRC                             DONE
+Stage 6  Normal Bidirectional E2E        DONE
+Stage 7  RX Timeout                      DONE
+```
+
+下一階段：
+
+```text
+Stage 8  RETRANSMIT_REQUEST
+Stage 9  Sender Packet Cache
+Stage 10 Full Fault / Stress Test
+```
+
+---
+
+# 20. Stage 8/9 的注意事項
+
+目前程式中曾建立：
+
+```c
+USB_Packet_SendRetransmitRequest()
+```
+
+但它尚未代表正式完成的 Stage 8 protocol。
+
+因此不能直接把目前版本視為：
+
+```text
+RETRANSMIT_REQUEST 已完成
+```
+
+明天需要重新確認：
+
+1. RETRANSMIT_REQUEST 的 Packet Type。
+2. Request Packet 自己的 Header Sequence。
+3. Request Payload 裡的 requested sequence。
+4. CM5 如何識別要求重傳哪一筆 Packet。
+5. STM32 如何保存最後一次或多筆已送出的 Packet。
+6. Retransmission 是否需要 retry limit。
+7. Timeout 與 CRC error 哪些情況觸發 retransmission。
+8. 如何避免 retransmission request 本身造成循環。
+
+Stage 8/9 應建立在今天已驗證成功的：
+
+```text
+Fragment RX
++
+CRC
++
+Timeout
+```
+
+之上，而不是重新設計 USB transport。
+
+---
+
+# 21. 重要設計原則
+
+STM32 USB CDC transport 的核心原則：
+
+1. USB CDC callback 不等於 Packet boundary。
+2. Packet 必須透過 RX accumulator 組合。
+3. Fragment 尚未完整時不可 Decode。
+4. CRC 只能對完整 Packet 驗證。
+5. Timeout 不可以使用 blocking delay。
+6. Timeout 必須清除 RX accumulator state。
+7. USB CDC Receive callback 必須快速返回。
+8. 正式 transport 不依賴測試用 Fragment TX state machine。
+9. Fault injection 與正式 transport logic 必須分離。
+10. Stage 8/9 只在目前已驗證的 architecture 上增加 retransmission capability。
+
+---
+
+# 22. 最終驗證目標
+
+最終 USB transport 要達成：
+
+```text
+CM5
+ │
+ │ COMMAND
+ ▼
+STM32
+ │
+ │ RESPONSE
+ ▼
+CM5
+```
+
+並能處理：
+
+```text
+正常 Packet
+    │
+    ├── Fragment
+    │
+    ├── CRC Error
+    │
+    ├── Timeout
+    │
+    └── Lost / incomplete packet
+             │
+             ▼
+       RETRANSMIT_REQUEST
+             │
+             ▼
+       Sender Packet Cache
+             │
+             ▼
+        Retransmission
+```
+
+目前已完成的部分：
+
+```text
+正常傳輸
+Fragment RX
+CRC
+Timeout
+```
+
+下一階段才加入：
+
+```text
+Retransmission
+```
+
+---
+## 測試輸出 CM5
+```text
+herman@RPiCM5:~/usb_command_test/build $ ./usb_command_test "MOV R 1000 1000 500 0 0 0"
+
+[USB TX] COMMAND seq=1 payload=27 total=37
+[USB TX] HEX: 47 4D 01 01 01 00 1B 00 4D 4F 56 20 52 20 31 30 30 30 20 31 30 30 30 20 35 30 30 20 30 20 30 20 30 0D 0A 22 54
+Command sent
+[USB RX] Len=30
+[USB RX] HEX: 47 4D 01 02 01 00 14 00 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 32 37 0D 0A 47 25
+[USB RX] Packet OK type=0x2 seq=1 payload=20
+[USB RX] Payload HEX: 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 32 37 0D 0A
+Response: RX OK SEQ=1 LEN=27
+
+
+herman@RPiCM5:~/usb_command_test/build $ ./usb_command_test "SPI R U 10 5 2"
+
+[USB TX] COMMAND seq=1 payload=16 total=26
+[USB TX] HEX: 47 4D 01 01 01 00 10 00 53 50 49 20 52 20 55 20 31 30 20 35 20 32 0D 0A DF 91
+Command sent
+[USB RX] Len=30
+[USB RX] HEX: 47 4D 01 02 01 00 14 00 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 31 36 0D 0A 16 A1
+[USB RX] Packet OK type=0x2 seq=1 payload=20
+[USB RX] Payload HEX: 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 31 36 0D 0A
+Response: RX OK SEQ=1 LEN=16
+
+
+herman@RPiCM5:~/usb_command_test/build $ ./usb_command_test "MPV M01 M03 1200.0 -35.5"
+
+[USB TX] COMMAND seq=1 payload=26 total=36
+[USB TX] HEX: 47 4D 01 01 01 00 1A 00 4D 50 56 20 4D 30 31 20 4D 30 33 20 31 32 30 30 2E 30 20 2D 33 35 2E 35 0D 0A 4B B8
+Command sent
+[USB RX] Len=30
+[USB RX] HEX: 47 4D 01 02 01 00 14 00 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 32 36 0D 0A 16 E5
+[USB RX] Packet OK type=0x2 seq=1 payload=20
+[USB RX] Payload HEX: 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 32 36 0D 0A
+Response: RX OK SEQ=1 LEN=26
+
+```
+## 對應的 STM32H755 輸出
+```text
+[USB RX] Len=37
+[USB RX] Data HEX: 47 4D 01 01 01 00 1B 00 4D 4F 56 20 52 20 31 30 30 30 20 31 30 30 30 20 35 30 30 20 30 20 30 20 30 0D 0A 22 54
+[USB PKT] Full packet: type=0x01 seq=1 payload=27
+[USB PKT] CRC RX=0x5422 CALC=0x5422
+[USB PKT] CRC OK
+[USB PKT] COMMAND received, seq=1
+[USB PKT] Payload HEX: 4D 4F 56 20 52 20 31 30 30 30 20 31 30 30 30 20 35 30 30 20 30 20 30 20 30 0D 0A
+[USB PKT TX] RESPONSE seq=1 payload=20 total=30
+[USB PKT TX] HEX: 47 4D 01 02 01 00 14 00 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 32 37 0D 0A 47 25
+[USB PKT TX] CDC_Transmit_FS result=0
+
+
+[USB RX] Len=26
+[USB RX] Data HEX: 47 4D 01 01 01 00 10 00 53 50 49 20 52 20 55 20 31 30 20 35 20 32 0D 0A DF 91
+[USB PKT] Full packet: type=0x01 seq=1 payload=16
+[USB PKT] CRC RX=0x91DF CALC=0x91DF
+[USB PKT] CRC OK
+[USB PKT] COMMAND received, seq=1
+[USB PKT] Payload HEX: 53 50 49 20 52 20 55 20 31 30 20 35 20 32 0D 0A
+[USB PKT TX] RESPONSE seq=1 payload=20 total=30
+[USB PKT TX] HEX: 47 4D 01 02 01 00 14 00 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 31 36 0D 0A 16 A1
+[USB PKT TX] CDC_Transmit_FS result=0
+
+
+[USB RX] Len=36
+[USB RX] Data HEX: 47 4D 01 01 01 00 1A 00 4D 50 56 20 4D 30 31 20 4D 30 33 20 31 32 30 30 2E 30 20 2D 33 35 2E 35 0D 0A 4B B8
+[USB PKT] Full packet: type=0x01 seq=1 payload=26
+[USB PKT] CRC RX=0xB84B CALC=0xB84B
+[USB PKT] CRC OK
+[USB PKT] COMMAND received, seq=1
+[USB PKT] Payload HEX: 4D 50 56 20 4D 30 31 20 4D 30 33 20 31 32 30 30 2E 30 20 2D 33 35 2E 35 0D 0A
+[USB PKT TX] RESPONSE seq=1 payload=20 total=30
+[USB PKT TX] HEX: 47 4D 01 02 01 00 14 00 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 32 36 0D 0A 16 E5
+[USB PKT TX] CDC_Transmit_FS result=0
+
+```
+---
+
