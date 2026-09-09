@@ -3527,3 +3527,524 @@ Response: RX OK SEQ=1 LEN=26
 ```
 ---
 
+# 第 8 階段 STM32H755 收到來自 Raspberry Pi CM5 的不完整錯誤封包，在 50ms timeout後，要求 CM5 重送封包。
+
+**現在可以認定「錯誤／不完整封包 → STM32 要求重傳 → CM5 重送原始完整封包 → STM32 正確接收、CRC 驗證並執行」這條機制已經成功。**
+
+---
+
+## USB CDC Reliable Packet Transport — Retransmission Mechanism
+
+### Development Stage 7/8 — Incomplete Packet Retransmission
+
+本階段的目標，是在既有 STM32H755 ↔ Raspberry Pi CM5 USB CDC 通訊架構上，加入「封包不完整時要求 CM5 重傳」的可靠傳輸機制。
+
+**本階段不修改既有 USB CDC 架構，也不重新設計 Packet Protocol。**
+
+既有的：
+
+* USB CDC ACM
+* `CDC_Receive_FS()`
+* `USBD_CDC_DataOut()`
+* `USBD_CDC_ReceivePacket()`
+* Packet Header
+* Payload Length
+* CRC16
+* COMMAND / RESPONSE
+
+均維持原本已驗證的架構。
+
+---
+
+### 1. Packet Format
+
+目前 USB Packet Format：
+
+```text
+Byte 0~1 : Magic
+Byte 2   : Version
+Byte 3   : Type
+Byte 4~5 : Sequence
+Byte 6~7 : Payload Length
+Byte 8~N : Payload
+Last 2   : CRC16
+```
+
+目前定義：
+
+```text
+0x01 : COMMAND
+0x02 : RESPONSE
+0x03 : ACK
+0x04 : RETRANSMIT_REQUEST
+```
+
+CRC16 使用既有的 Modbus-style CRC：
+
+```text
+Polynomial : 0xA001
+Initial    : 0xFFFF
+```
+
+CRC 演算法與既有驗證結果均未修改。
+
+---
+
+## 2. Problem Found
+
+最初的 Packet Receiver 已經可以處理 USB CDC Fragment。
+
+例如完整 COMMAND 為：
+
+```text
+37 bytes
+```
+
+但第一次只收到：
+
+```text
+16 bytes
+```
+
+STM32 能正確判斷：
+
+```text
+[USB PKT] Fragment: 16/37 bytes, waiting...
+```
+
+原本的 Timeout 行為只有：
+
+```text
+Incomplete packet
+        ↓
+Timeout
+        ↓
+Discard packet
+        ↓
+Return to normal reception
+```
+
+這樣會直接遺失 COMMAND。
+
+因此本階段增加 Retransmission 機制。
+
+---
+
+## 3. STM32 RX Timeout
+
+STM32 目前使用：
+
+```c
+#define USB_PKT_RX_TIMEOUT_MS 50U
+```
+
+當收到 Fragment 後，在指定時間內沒有形成完整 Packet：
+
+```text
+RX incomplete
+    ↓
+50 ms timeout
+```
+
+STM32 會判定封包接收失敗。
+
+---
+
+## 4. RETRANSMIT_REQUEST
+
+Timeout 後，STM32 不再單純丟棄封包，而是取得目前 Packet 的 Sequence：
+
+```text
+seq = 1
+```
+
+並送出：
+
+```text
+RETRANSMIT_REQUEST
+```
+
+實際測試封包：
+
+```text
+47 4D 01 04 01 00 02 00 01 00 2F AF
+```
+
+解析：
+
+```text
+Magic          = 47 4D
+Version        = 01
+Type           = 04
+Sequence       = 1
+Payload Length = 2
+Payload        = 01 00
+CRC16          = 2F AF
+```
+
+STM32 測試輸出：
+
+```text
+[USB PKT] ERROR: RX TIMEOUT - incomplete packet, received=16 bytes
+[USB PKT] Request retransmission seq=1
+[USB PKT TX] RETRANSMIT_REQUEST seq=1 total=12
+[USB PKT TX] CDC_Transmit_FS result=0
+[USB PKT] State -> WAIT_RETRANSMIT seq=1
+```
+
+---
+
+## 5. WAIT_RETRANSMIT State
+
+STM32 在送出 `RETRANSMIT_REQUEST` 後進入：
+
+```text
+WAIT_RETRANSMIT
+```
+
+新增的狀態：
+
+```c
+static uint8_t packet_rx_waiting_retransmit = 0U;
+static uint32_t packet_rx_retransmit_tick = 0U;
+```
+
+進入狀態：
+
+```text
+packet_rx_waiting_retransmit = 1
+```
+
+並記錄：
+
+```text
+packet_rx_retransmit_tick
+```
+
+---
+
+## 6. Retransmission Timeout
+
+為避免 STM32 無限等待重傳，`WAIT_RETRANSMIT` 本身也具有 Timeout。
+
+流程：
+
+```text
+WAIT_RETRANSMIT
+        ↓
+等待 retransmitted packet
+        ↓
+Timeout
+        ↓
+Clear RX state
+        ↓
+Return to normal IDLE
+```
+
+測試結果：
+
+```text
+[USB PKT] RETRANSMIT TIMEOUT - no retransmitted packet
+[USB PKT DEBUG] Before reset: length=0 waiting=1 seq=1
+[USB PKT DEBUG] After reset: length=0 waiting=0 seq=0
+```
+
+證明 STM32 不會永久卡在 `WAIT_RETRANSMIT`。
+
+---
+
+## 7. Timing Race Investigation
+
+實際測試發現，Retransmission 還存在 USB CDC Host/Device timing 問題。
+
+最初測試：
+
+```text
+STM32 RX timeout = 100 ms
+CM5 RX timeout   = 100 ms
+```
+
+雙方 Timeout 同時為 100 ms 時，CM5 無法穩定進入 retransmission 流程。
+
+因此修改為：
+
+```text
+STM32 RX timeout = 50 ms
+CM5 RX timeout   = 100 ms
+```
+
+讓 STM32 明確先於 CM5 timeout：
+
+```text
+CM5
+  ↓
+送出 incomplete packet
+  ↓
+STM32 等待 50 ms
+  ↓
+STM32 RETRANSMIT_REQUEST
+  ↓
+CM5 仍處於 100 ms 等待期間
+  ↓
+處理 RETRANSMIT_REQUEST
+```
+
+此修改後，CM5 已可以正確收到 `RETRANSMIT_REQUEST`。
+
+---
+
+## 8. Immediate Retransmission Timing
+
+進一步測試發現：
+
+如果 CM5 收到：
+
+```text
+RETRANSMIT_REQUEST
+```
+
+後立即重新送出完整 Packet，STM32 有時無法立即進入第二次：
+
+```text
+CDC_Receive_FS()
+```
+
+因此進行 timing isolation test。
+
+CM5 在收到 Retransmission Request 後加入：
+
+```cpp
+std::this_thread::sleep_for(
+    std::chrono::milliseconds(20)
+);
+```
+
+目前測試設定：
+
+```text
+STM32 RX timeout       = 50 ms
+CM5 RX timeout         = 100 ms
+CM5 retransmit delay   = 20 ms
+```
+
+---
+
+## 9. Successful Retransmission
+
+加入 20 ms delay 後，完整流程成功：
+
+```text
+CM5
+  ↓
+Send incomplete COMMAND (16 bytes)
+  ↓
+STM32
+  ↓
+CDC_Receive_FS()
+  ↓
+Fragment: 16/37 bytes
+  ↓
+50 ms timeout
+  ↓
+RETRANSMIT_REQUEST seq=1
+  ↓
+WAIT_RETRANSMIT
+  ↓
+CM5 waits 20 ms
+  ↓
+Resend complete COMMAND (37 bytes)
+  ↓
+STM32
+  ↓
+USBD_CDC_DataOut()
+  ↓
+CDC_Receive_FS()
+  ↓
+37 bytes
+  ↓
+CRC OK
+  ↓
+Leave WAIT_RETRANSMIT
+  ↓
+COMMAND received
+  ↓
+RESPONSE
+```
+
+成功測試的關鍵 STM32 輸出：
+
+```text
+[USB RX] Len=37
+[USB RX] Data HEX: 47 4D 01 01 01 00 1B 00 4D 4F 56 20 52 20 31 30 30 30 20 31 30 30 30 20 35 30 30 20 30 20 30 20 30 0D 0A 22 54
+[USB PKT DEBUG] Before ProcessRx: length=37 waiting=1 seq=1
+[USB PKT] Full packet: type=0x01 seq=1 payload=27
+[USB PKT] CRC RX=0x5422 CALC=0x5422
+[USB PKT] CRC OK
+[USB PKT] Retransmitted packet received, leaving WAIT_RETRANSMIT
+[USB PKT] COMMAND received, seq=1
+[USB PKT] Payload HEX: 4D 4F 56 20 52 20 31 30 30 30 20 31 30 30 30 20 35 30 30 20 30 20 30 20 30 0D 0A
+[USB PKT TX] RESPONSE seq=1 payload=20 total=30
+[USB PKT TX] HEX: 47 4D 01 02 01 00 14 00 52 58 20 4F 4B 20 53 45 51 3D 31 20 4C 45 4E 3D 32 37 0D 0A 47 25
+[USB PKT TX] CDC_Transmit_FS result=0
+
+```
+
+---
+
+## 10. Repeated Verification
+
+為確認成功不是偶發現象，連續執行：
+
+```bash
+./usb_retransmit_test
+```
+
+共 4 次。
+
+四次測試均成功進入：
+
+```text
+[USB PKT] Retransmitted packet received, leaving WAIT_RETRANSMIT
+```
+
+並完成：
+
+```text
+Retransmission
+    ↓
+CRC verification
+    ↓
+COMMAND processing
+    ↓
+RESPONSE
+```
+
+因此目前可以認定：
+
+> **STM32H755 端的「不完整 COMMAND → RETRANSMIT_REQUEST → CM5 重傳完整 COMMAND → STM32 正確接收並執行」機制已完成並通過重複測試。**
+
+---
+
+## 11. USB CDC Callback Verification
+
+本階段也特別確認了 USB CDC callback chain。
+
+實際架構：
+
+```text
+USB OUT
+   ↓
+USBD_CDC_DataOut()
+   ↓
+USBD_CDC_ItfTypeDef.Receive
+   ↓
+CDC_Receive_FS()
+   ↓
+USBD_CDC_ReceivePacket()
+   ↓
+USBD_LL_PrepareReceive()
+```
+
+`CDC_Receive_FS()` 不需要因為 retransmission 而重新註冊。
+
+`USBD_CDC_ReceivePacket()` 已確認會重新呼叫：
+
+```c
+USBD_LL_PrepareReceive()
+```
+
+並且成功回傳：
+
+```text
+USBD_OK = 0
+```
+
+因此本階段沒有修改 callback registration 或 USB CDC driver 架構。
+
+---
+
+## 12. Current STM32H755 Status
+
+目前 STM32H755 USB CDC 已完成並驗證：
+
+* USB CDC 基本雙向通訊
+* COMMAND Packet
+* RESPONSE Packet
+* Packet Header parsing
+* Payload Length parsing
+* CRC16 verification
+* Fragmented Packet reception
+* Incomplete Packet Timeout
+* RETRANSMIT_REQUEST
+* WAIT_RETRANSMIT state
+* Retransmission Timeout
+* Retransmitted Packet reception
+* CRC verification after retransmission
+* COMMAND execution after retransmission
+* RESPONSE after retransmission
+* Retransmission timing adjustment
+* Repeated retransmission test
+
+目前已驗證的 timing：
+
+```text
+STM32 RX timeout       : 50 ms
+CM5 RX timeout         : 100 ms
+CM5 retransmit delay   : 20 ms
+```
+
+---
+
+## 13. GitHub Checkpoint
+
+本階段完成後，STM32H755 程式應建立一個正式 Git checkpoint。
+
+此 checkpoint 的目的：
+
+```text
+已驗證的 STM32 USB Retransmission 版本
+```
+
+後續 CM5 USB Transport / Command Parser 修改若發生問題，可以從此 checkpoint 回復，而不需要重新追查本階段已解決的 USB retransmission 問題。
+
+**重要：**
+
+本階段的測試程式僅用於驗證功能。
+
+驗證完成後：
+
+* 不保留測試版 `main`
+* 不建立長期測試分支
+* 不改變正式 USB 架構
+* 將已驗證功能整合回正式原始程式
+* GitHub checkpoint 保存的是正式 STM32H755 程式
+
+---
+
+## 14. Next Stage
+
+STM32H755 Retransmission mechanism 完成 checkpoint 後，再處理 Raspberry Pi CM5 端。
+
+下一階段重點：
+
+```text
+CM5 USB Transport
+        ↓
+RETRANSMIT_REQUEST handling
+        ↓
+Cache / Sequence management
+        ↓
+20 ms retransmission timing
+        ↓
+Normal COMMAND
+        ↓
+Retransmission COMMAND
+        ↓
+Normal COMMAND
+```
+
+必須確保新增的 Retransmission 機制不會污染既有正常 COMMAND 流程。
+
+
+
+

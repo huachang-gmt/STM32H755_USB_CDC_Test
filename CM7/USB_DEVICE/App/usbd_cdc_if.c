@@ -77,7 +77,7 @@
     (USB_PKT_HEADER_SIZE + USB_PKT_MAX_PAYLOAD + USB_PKT_CRC_SIZE)
 
 /*已經開始收到一個封包，但 100 ms 內仍沒有收完整，就視為接收 timeout*/   
-#define USB_PKT_RX_TIMEOUT_MS          100U
+#define USB_PKT_RX_TIMEOUT_MS          50U
 /* USER CODE END PRIVATE_DEFINES */
 
 
@@ -88,6 +88,8 @@ static uint8_t packet_rx_buffer[USB_PKT_MAX_SIZE];
 static uint32_t packet_rx_length = 0U;
 static uint32_t packet_rx_start_tick = 0U;
 static uint16_t packet_rx_sequence = 0U;
+static uint8_t packet_rx_waiting_retransmit = 0U;
+static uint32_t packet_rx_retransmit_tick = 0U;
 /* USER CODE END PV */
 
 
@@ -327,6 +329,15 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 
     packet_rx_length += *Len;
 
+
+    printf(
+        "[USB PKT DEBUG] Before ProcessRx: length=%lu waiting=%u seq=%u\r\n",
+        packet_rx_length,
+        packet_rx_waiting_retransmit,
+        packet_rx_sequence
+    );
+
+
     USB_Packet_ProcessRx();
 
     if (packet_rx_length == 0U)
@@ -353,6 +364,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
+
   /* USER CODE END 6 */
 }
 
@@ -925,6 +937,16 @@ static void USB_Packet_ProcessRx(void)
             "[USB PKT] CRC OK\r\n"
         );
 
+        if (packet_rx_waiting_retransmit != 0U)
+        {
+            printf(
+                "[USB PKT] Retransmitted packet received, leaving WAIT_RETRANSMIT\r\n"
+            );
+
+            packet_rx_waiting_retransmit = 0U;
+            packet_rx_retransmit_tick = 0U;
+        }
+
         if (packet_type == USB_PKT_TYPE_COMMAND)
         {
             printf(
@@ -973,25 +995,76 @@ static void USB_Packet_ProcessRx(void)
     }
 }
 
-// 讓 Timeout「只丟棄，不要求重傳」
 void USB_Packet_CheckRxTimeout(void)
 {
+    const uint32_t now = HAL_GetTick();
+
+    /* STEP 3:
+     * Waiting for the one allowed retransmission.
+     */
+    if (packet_rx_waiting_retransmit != 0U)
+    {
+        if ((now - packet_rx_retransmit_tick) >= USB_PKT_RX_TIMEOUT_MS)
+        {
+            printf(
+                "[USB PKT] RETRANSMIT TIMEOUT - no retransmitted packet\r\n"
+            );
+
+            printf(
+                "[USB PKT DEBUG] Before reset: length=%lu waiting=%u seq=%u\r\n",
+                packet_rx_length,
+                packet_rx_waiting_retransmit,
+                packet_rx_sequence
+            );
+
+            packet_rx_length = 0U;
+            packet_rx_start_tick = 0U;
+            packet_rx_sequence = 0U;
+            packet_rx_waiting_retransmit = 0U;
+            packet_rx_retransmit_tick = 0U;
+
+            printf(
+                "[USB PKT DEBUG] After reset: length=%lu waiting=%u seq=%u\r\n",
+                packet_rx_length,
+                packet_rx_waiting_retransmit,
+                packet_rx_sequence
+            );
+        }
+
+        return;
+    }
+
+    /* Normal packet reception timeout */
     if (packet_rx_length == 0U)
         return;
 
-    const uint32_t now = HAL_GetTick();
+    if ((now - packet_rx_start_tick) < USB_PKT_RX_TIMEOUT_MS)
+        return;
 
-    if ((now - packet_rx_start_tick) >= USB_PKT_RX_TIMEOUT_MS)
-    {
-        printf(
-            "[USB PKT] ERROR: RX TIMEOUT - incomplete packet, received=%lu bytes\r\n",
-            packet_rx_length
-        );
+    printf(
+        "[USB PKT] ERROR: RX TIMEOUT - incomplete packet, received=%lu bytes\r\n",
+        packet_rx_length
+    );
 
-        packet_rx_length = 0U;
-        packet_rx_start_tick = 0U;
-        packet_rx_sequence = 0U;
-    }
+    const uint16_t sequence = packet_rx_sequence;
+
+    printf(
+        "[USB PKT] Request retransmission seq=%u\r\n",
+        sequence
+    );
+
+    packet_rx_length = 0U;
+    packet_rx_start_tick = 0U;
+
+    packet_rx_waiting_retransmit = 1U;
+    packet_rx_retransmit_tick = now;
+
+    USB_Packet_SendRetransmitRequest(sequence);
+
+    printf(
+        "[USB PKT] State -> WAIT_RETRANSMIT seq=%u\r\n",
+        sequence
+    );
 }
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
