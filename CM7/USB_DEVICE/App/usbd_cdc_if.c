@@ -76,8 +76,14 @@
 #define USB_PKT_MAX_SIZE            \
     (USB_PKT_HEADER_SIZE + USB_PKT_MAX_PAYLOAD + USB_PKT_CRC_SIZE)
 
-/*已經開始收到一個封包，但 100 ms 內仍沒有收完整，就視為接收 timeout*/   
+/*已經開始收到一個封包，但 50 ms 內仍沒有收完整，就視為接收 timeout*/   
 #define USB_PKT_RX_TIMEOUT_MS          50U
+
+#define USB_RESPONSE_TIMEOUT_MS       5U    // Response Timeout = 5 ms
+// 測試使用，如果在 5ms 以內送出 Response Command 給 CM5 -- 驗證成功
+//#define USB_RESPONSE_TEST_READY_MS    4U    // 測試 Response = 4 ms
+
+
 /* USER CODE END PRIVATE_DEFINES */
 
 
@@ -90,6 +96,14 @@ static uint32_t packet_rx_start_tick = 0U;
 static uint16_t packet_rx_sequence = 0U;
 static uint8_t packet_rx_waiting_retransmit = 0U;
 static uint32_t packet_rx_retransmit_tick = 0U;
+
+static uint8_t  usb_response_waiting = 0U;  // 是否正在等待 EtherCAT Response
+static uint16_t usb_response_sequence = 0U; // 這次 COMMAND 的 Sequence
+static uint32_t usb_response_start_tick = 0U;   // 開始等待的時間
+
+char usb_response_buffer[USB_RESPONSE_MAX_LENGTH]; // 提供 我的同事把 Response command 複製進去
+static uint16_t usb_response_length = 0U;
+
 /* USER CODE END PV */
 
 
@@ -161,7 +175,10 @@ static void USB_Packet_ProcessRx(void);
 
 static void USB_Packet_SendResponse(
     uint16_t sequence,
-    uint16_t payload_length);
+    const char *response_payload);
+
+//static uint8_t USB_ResponseSubmit(const char *response_payload);
+
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -178,6 +195,16 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 };
 
 /* Private functions ---------------------------------------------------------*/
+
+static void USB_Response_Init(void)
+{
+    usb_response_buffer[0] = '\0';
+    usb_response_length = 0U;
+    usb_response_waiting = 0U;
+    usb_response_sequence = 0U;
+    usb_response_start_tick = 0U;
+}
+
 /**
   * @brief  Initializes the CDC media low layer over the FS USB IP
   * @retval USBD_OK if all operations are OK else USBD_FAIL
@@ -185,6 +212,8 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 static int8_t CDC_Init_FS(void)
 {
   /* USER CODE BEGIN 3 */
+    USB_Response_Init();
+
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
@@ -456,42 +485,23 @@ static uint16_t USB_Packet_ReadUint16LE(
 
 static void USB_Packet_SendResponse(
     uint16_t sequence,
-    uint16_t payload_length)
+    const char *response_payload)
 {
     static uint8_t packet[128];
     uint32_t packet_length = 0U;
 
-    char response_payload[64];
+    const uint16_t response_length =
+        (uint16_t)strlen(response_payload);
 
-    const int response_length = snprintf(
-        response_payload,
-        sizeof(response_payload),
-        "RX OK SEQ=%u LEN=%u\r\n",
-        sequence,
-        payload_length
-    );
-
-    if (response_length <= 0)
+    if (response_length == 0U)
     {
         return;
     }
 
-    if ((uint32_t)response_length > 64U)
+    if (response_length > 64U)
     {
         return;
     }
-
-    /*
-     * ------------------------------------------------------------
-     * Transport Header
-     *
-     * Byte 0~1 : Magic
-     * Byte 2   : Version
-     * Byte 3   : RESPONSE
-     * Byte 4~5 : Sequence
-     * Byte 6~7 : Payload Length
-     * ------------------------------------------------------------
-     */
 
     packet[0] = USB_PKT_MAGIC0;
     packet[1] = USB_PKT_MAGIC1;
@@ -501,30 +511,19 @@ static void USB_Packet_SendResponse(
     packet[4] = (uint8_t)(sequence & 0x00FFU);
     packet[5] = (uint8_t)((sequence >> 8U) & 0x00FFU);
 
-    packet[6] = (uint8_t)(
-        (uint16_t)response_length & 0x00FFU
-    );
+    packet[6] = (uint8_t)(response_length & 0x00FFU);
+    packet[7] = (uint8_t)((response_length >> 8U) & 0x00FFU);
 
-    packet[7] = (uint8_t)(
-        ((uint16_t)response_length >> 8U) & 0x00FFU
-    );
-
-    /*
-     * Payload
-     */
     memcpy(
         &packet[USB_PKT_HEADER_SIZE],
         response_payload,
-        (uint32_t)response_length
+        response_length
     );
 
     packet_length =
         USB_PKT_HEADER_SIZE +
-        (uint32_t)response_length;
+        response_length;
 
-    /*
-     * CRC covers Header + Payload.
-     */
     const uint16_t crc =
         USB_Packet_CalculateCRC16(
             packet,
@@ -540,7 +539,7 @@ static void USB_Packet_SendResponse(
     printf(
         "[USB PKT TX] RESPONSE seq=%u payload=%u total=%lu\r\n",
         sequence,
-        (uint16_t)response_length,
+        response_length,
         packet_length
     );
 
@@ -548,10 +547,7 @@ static void USB_Packet_SendResponse(
 
     for (uint32_t i = 0U; i < packet_length; i++)
     {
-        printf(
-            " %02X",
-            packet[i]
-        );
+        printf(" %02X", packet[i]);
     }
 
     printf("\r\n");
@@ -646,6 +642,203 @@ static void USB_Packet_SendRetransmitRequest(uint16_t sequence)
         result
     );
 }
+
+void USB_Packet_ProcessResponseWait(void)
+{
+    if (usb_response_waiting == 0U)
+    {
+        return;
+    }
+
+    printf("USB_Packet_ProcessResponseWait()\r\n"); // idle status 測試使用
+
+    const uint32_t elapsed =
+        HAL_GetTick() - usb_response_start_tick;
+
+
+
+/*******************  測試使用  ********************************
+// 模擬「同事如何把 Response command 放進 buffer」
+if ((usb_response_waiting != 0U) &&
+    (usb_response_length == 0U) &&
+    (elapsed >= 4U))
+{
+    const char test_response[] = "DONE";
+
+    memcpy(
+        usb_response_buffer,
+        test_response,
+        sizeof(test_response)
+    );
+
+    usb_response_length =
+        (uint16_t)(sizeof(test_response) - 1U);
+
+    printf(
+        "[USB RESP TEST] Response placed into buffer at %lu ms\r\n",
+        elapsed
+    );
+}
+*********************************************************************************/
+
+
+
+    
+    if (usb_response_length > 0U)
+    {
+        printf(
+            "[USB RESP TEST] Buffer contains response: %s\r\n",
+            usb_response_buffer
+        );
+
+        USB_Packet_SendResponse(
+            usb_response_sequence,
+            usb_response_buffer
+        );
+
+        usb_response_buffer[0] = '\0';
+        usb_response_length = 0U;
+        usb_response_waiting = 0U;
+
+        printf(
+            "[USB RESP] Response sent at %lu ms\r\n",
+            elapsed
+        );
+
+        return;
+    }
+    
+    /*
+     * Test:
+     * Simulate EtherCAT response at 4 ms.
+     * 測試使用，如果在 5ms 以內送出 Response Command 給 CM5 -- 驗證成功
+     */
+    /*
+    if (elapsed >= USB_RESPONSE_TEST_READY_MS)
+    {
+        usb_response_waiting = 0U;
+
+        // 這是測試使用固定的 Response Command "DONE"
+        USB_Packet_SendResponse(
+            usb_response_sequence,
+            "DONE"
+        );
+
+        printf(
+            "[USB RESP] Test response DONE after at %lu ms\r\n",
+            elapsed
+        );
+
+        return;
+    }
+    */
+    /*
+     * Test:
+     * Simulate EtherCAT response at 4 ms.
+     */
+    /*
+    if (elapsed >= USB_RESPONSE_TEST_READY_MS)
+    {
+        USB_ResponseSubmit("DONE");
+
+        printf(
+            "[USB RESP TEST] Simulated EtherCAT response at %lu ms\r\n",
+            elapsed
+        );
+
+        return;
+    }
+    */
+
+    if (elapsed >= USB_RESPONSE_TIMEOUT_MS)
+    {
+        usb_response_waiting = 0U;
+
+        USB_Packet_SendResponse(
+            usb_response_sequence,
+            "Response Timeout"
+        );
+
+        printf(
+            "[USB RESP] Response TIMEOUT at %lu ms\r\n",
+            elapsed
+        );
+
+        return;
+    }
+}
+
+/* 
+static uint8_t USB_ResponseSubmit(
+    const char *response_payload)
+{
+    if (response_payload == NULL)
+    {
+        return 0U;
+    }
+
+    if (usb_response_waiting == 0U)
+    {
+        printf("[USB RESP] Response rejected: timeout\r\n");
+        return 0U;
+    }
+
+    const uint32_t elapsed =
+        HAL_GetTick() - usb_response_start_tick;
+
+    if (elapsed >= USB_RESPONSE_TIMEOUT_MS)
+    {
+        usb_response_waiting = 0U;
+
+        printf(
+            "[USB RESP] Response rejected: timeout at %lu ms\r\n",
+            elapsed
+        );
+
+        return 0U;
+    }
+
+    const size_t response_length =
+        strlen(response_payload);
+
+    if (response_length == 0U)
+    {
+        return 0U;
+    }
+
+    if (response_length >= USB_RESPONSE_MAX_LENGTH)
+    {
+        printf(
+            "[USB RESP] Response rejected: too long\r\n"
+        );
+
+        return 0U;
+    }
+
+    memcpy(
+        usb_response_buffer,
+        response_payload,
+        response_length + 1U
+    );
+
+    usb_response_length = (uint16_t)response_length;
+
+    USB_Packet_SendResponse(
+        usb_response_sequence,
+        usb_response_buffer
+    );
+
+    usb_response_waiting = 0U;
+
+    printf(
+        "[USB RESP] Response submitted at %lu ms, length=%u\r\n",
+        elapsed,
+        usb_response_length
+    );
+
+    return 1U;
+}
+*/
 
 static void USB_Packet_ProcessRx(void)
 {
@@ -970,9 +1163,16 @@ static void USB_Packet_ProcessRx(void)
 
             printf("\r\n");
 
-            USB_Packet_SendResponse(
-                sequence,
-                payload_length
+            usb_response_buffer[0] = '\0';
+            usb_response_length = 0U;
+
+            usb_response_sequence = sequence;
+            usb_response_start_tick = HAL_GetTick();
+            usb_response_waiting = 1U;
+
+            printf(
+                "[USB RESP] Waiting for response, seq=%u\r\n",
+                sequence
             );
 
         }

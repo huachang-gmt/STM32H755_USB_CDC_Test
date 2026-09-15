@@ -169,9 +169,9 @@ Error_Handler();
 
     /* USER CODE BEGIN 3 */
 
-    USB_Packet_CheckRxTimeout();
+    USB_Packet_CheckRxTimeout();  // 單一入口，等待 CM5 USB Host 丟資料過來而接收之
 
-
+    USB_Packet_ProcessResponseWait(); // 單一入口，負責把 Response command 傳送回去給 CM5
   }
   /* USER CODE END 3 */
 }

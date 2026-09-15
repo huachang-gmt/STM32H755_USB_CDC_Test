@@ -4046,5 +4046,944 @@ Normal COMMAND
 必須確保新增的 Retransmission 機制不會污染既有正常 COMMAND 流程。
 
 
+# [2026-09-14] 更新版本： 
+## 更新內容：
+- MCU STM32H755 USB Device 傳送 Response Command 給 Raspberry Pi CM5 。
+- 設定回應等待時間為 5ms。
+- 如果 MCU 接收到 來自 CM5 的 Command 後，MCU 會進入等待，等待 EtherCAT 回覆 Response Command。 目前設定等待時間為 5ms。超過 5ms 仍未收到 Response Command，視同為 Timeout，跳離等待，即便後來 Response Command 送來，也會被丟棄。
+- 如果 Response Command 在 timeout 時間內送來，STM32H755 會把 Response Command 透過 USB 傳送給 CM5 。
+- 入口函數式只有兩個，放在 main.c 檔案內的 while Loop 。USB_Packet_CheckRxTimeout(); 與 USB_Packet_ProcessResponseWait();
+- USB_Packet_CheckRxTimeout() 是等待 CM5 的 Command 。
+- USB_Packet_ProcessResponseWait() 是 將 Response Command 回傳給 CM5 ，如果 有接收到 CM5 的 Command 時。
 
+## 設計架構
+```
+CM5 Command
+    ↓
+STM32 收到 COMMAND
+    ↓
+設定「等待 Response」旗標
+啟動 5 ms 計時
+    ↓
+USB_Packet_ProcessResponseWait()
+    │
+    ├─ 沒有等待 Command
+    │      → buffer 空 → return
+    │
+    ├─ 有等待 Command
+    │      ├─ buffer 空
+    │      │    → 尚未收到同事 Response
+    │      │    → 檢查 timeout
+    │      │
+    │      └─ buffer 非空
+    │           → 傳送 Response
+    │           → buffer 清空
+    │           → 清除等待旗標
+    │
+    └─ 超過 5 ms
+           → Response Timeout
+           → 清除等待旗標
+```
 
+# STM32H755 USB Response Command 設計與整合說明
+
+## 1. 功能目的
+
+本模組負責處理 CM5 與 STM32H755 之間的 USB CDC Response Command 傳輸。
+
+系統流程如下：
+
+```text
+End User
+   │
+   │ TCP Command
+   ▼
+CM5 TCP Server / Command Parser
+   │
+   │ USB COMMAND Packet
+   ▼
+STM32H755 USB CDC
+   │
+   │ Command
+   ▼
+EtherCAT / Motion Control
+   │
+   │ Response Command
+   ▼
+STM32H755 USB Response Buffer
+   │
+   ▼
+USB_Packet_ProcessResponseWait()
+   │
+   │ USB RESPONSE Packet
+   ▼
+CM5
+   │
+   ▼
+End User
+```
+
+本設計的主要目標：
+
+1. CM5 Command 收到後，STM32 不立即回覆。
+2. STM32 啟動 Response timeout 計時。
+3. EtherCAT / Motion Control 程式產生 Response Command 後，只需要將資料複製到共用 Response Buffer。
+4. USB 模組自行偵測 Buffer 是否有 Response。
+5. Buffer 有資料時，自動封裝並傳送 Response Packet。
+6. Response 傳送完成後自動清空 Buffer。
+7. Response 在 timeout 期間沒有產生時，STM32 自動送出 `Response Timeout`。
+8. 不增加 Response retransmission mechanism。
+9. 同事整合時不需要呼叫額外的 Response Submit Function。
+10. STM32 `while(1)` 僅需要保留兩個 USB service function。
+
+---
+
+# 2. USB Response 設計原則
+
+本設計採用：
+
+```text
+Shared Buffer + Polling Service + Timeout
+```
+
+而不是：
+
+```text
+Response Submit API
+Callback
+Response Retransmission
+Blocking Wait
+```
+
+主要原因是 Response Command 本身很短，而且系統要求簡單、可預期、非阻塞。
+
+STM32 不需要理解 Response Command 的內容。
+
+STM32 USB 模組只負責：
+
+```text
+等待
+ ↓
+確認 Buffer
+ ↓
+封包
+ ↓
+傳送
+ ↓
+清空 Buffer
+```
+
+Response Command 的內容由 EtherCAT / Motion Control 端產生。
+
+---
+
+# 3. Main Loop 架構
+
+USB 模組在主迴圈中只需要：
+
+```c
+while (1)
+{
+    USB_Packet_CheckRxTimeout();
+    USB_Packet_ProcessResponseWait();
+}
+```
+
+## 3.1 USB_Packet_CheckRxTimeout()
+
+此 function 負責：
+
+```text
+CM5 → STM32
+```
+
+Command Packet 的接收 timeout / fragment 接收處理。
+
+此部分屬於 Command RX path。
+
+---
+
+## 3.2 USB_Packet_ProcessResponseWait()
+
+此 function 負責：
+
+```text
+STM32 → CM5
+```
+
+Response path。
+
+它同時負責：
+
+* Response waiting state
+* Timeout 判斷
+* Response Buffer 判斷
+* Response Packet 傳送
+* Buffer 清空
+* 結束目前 Response waiting window
+
+因此不需要另外增加：
+
+```c
+USB_ResponseSubmit();
+```
+
+或其他 Response service function。
+
+---
+
+# 4. Response Buffer
+
+Response Buffer 定義於：
+
+```text
+USB_DEVICE/App/usbd_cdc_if.c
+```
+
+```c
+char usb_response_buffer[USB_RESPONSE_MAX_LENGTH];
+```
+
+Buffer size：
+
+```c
+#define USB_RESPONSE_MAX_LENGTH    256U
+```
+
+Buffer declaration 放在：
+
+```text
+USB_DEVICE/App/usbd_cdc_if.h
+```
+
+```c
+#define USB_RESPONSE_MAX_LENGTH    256U
+
+extern char usb_response_buffer[USB_RESPONSE_MAX_LENGTH];
+```
+
+因此 EtherCAT / Motion Control 程式可以直接使用：
+
+```c
+usb_response_buffer
+```
+
+不需要呼叫額外的 USB Response function。
+
+---
+
+# 5. Response Buffer 使用方式
+
+同事的程式只需要將 Response Command 複製到：
+
+```c
+usb_response_buffer
+```
+
+例如 Response Command 為：
+
+```text
+DONE
+```
+
+可以：
+
+```c
+memcpy(
+    usb_response_buffer,
+    response_command,
+    response_length
+);
+```
+
+如果使用 C string，也可以：
+
+```c
+strcpy(
+    usb_response_buffer,
+    response_command
+);
+```
+
+實際整合時，建議使用 `memcpy()` 搭配明確的 Response 長度，以避免不必要的字串假設。
+
+---
+
+# 6. 同事端整合規則
+
+同事端不需要：
+
+```c
+USB_ResponseSubmit();
+```
+
+不需要：
+
+```c
+USB_Packet_SendResponse();
+```
+
+也不需要：
+
+```c
+usb_response_waiting = 1;
+```
+
+也不需要操作：
+
+```c
+usb_response_sequence
+usb_response_start_tick
+usb_response_length
+```
+
+這些都是 USB module 的內部狀態。
+
+同事端唯一需要處理的是：
+
+```c
+usb_response_buffer
+```
+
+也就是：
+
+```text
+EtherCAT / Motion Result
+        ↓
+建立 Response Command
+        ↓
+Copy 到 usb_response_buffer
+```
+
+之後 USB module 自己處理剩餘工作。
+
+---
+
+# 7. Response Waiting 機制
+
+目前 timeout：
+
+```c
+#define USB_RESPONSE_TIMEOUT_MS    5U
+```
+
+此數值未來可以依系統需求調整。
+
+當 STM32 收到 CM5 COMMAND 時：
+
+```c
+usb_response_buffer[0] = '\0';
+usb_response_length = 0U;
+
+usb_response_sequence = sequence;
+usb_response_start_tick = HAL_GetTick();
+usb_response_waiting = 1U;
+```
+
+此時代表：
+
+```text
+Command 已收到
+Response 尚未產生
+開始等待 Response
+```
+
+---
+
+# 8. Buffer Empty 狀態
+
+如果：
+
+```c
+usb_response_waiting == 0U
+```
+
+則：
+
+```c
+USB_Packet_ProcessResponseWait();
+```
+
+立即 return。
+
+因此在沒有 CM5 Command 的正常狀態下：
+
+```text
+USB Response module
+        ↓
+沒有 waiting command
+        ↓
+return
+```
+
+不會：
+
+* 傳送 Response
+* 傳送 Timeout
+* 產生 USB TX
+* 執行不必要處理
+
+---
+
+# 9. Response Buffer 有資料
+
+當 CM5 Command 已經收到，而且 Response Buffer 已經由 EtherCAT / Motion Control 程式填入：
+
+```text
+usb_response_buffer
+        ↓
+有 Response Command
+```
+
+`USB_Packet_ProcessResponseWait()` 會發現：
+
+```c
+usb_response_length > 0U
+```
+
+然後：
+
+```c
+USB_Packet_SendResponse(
+    usb_response_sequence,
+    usb_response_buffer
+);
+```
+
+Response Packet 會使用原本 CM5 Command 的 sequence。
+
+例如：
+
+```text
+CM5 Command sequence = 1
+```
+
+Response：
+
+```text
+Response sequence = 1
+```
+
+---
+
+# 10. Response 傳送完成後
+
+Response 傳送後：
+
+```c
+usb_response_buffer[0] = '\0';
+usb_response_length = 0U;
+usb_response_waiting = 0U;
+```
+
+因此：
+
+```text
+Response 已送出
+     ↓
+Buffer 清空
+     ↓
+Waiting 結束
+```
+
+同一個 Response 不會因為 main loop 下一次執行而再次傳送。
+
+---
+
+# 11. Response Timeout
+
+如果 CM5 Command 收到後：
+
+```text
+Response Buffer
+=
+empty
+```
+
+USB module 會持續等待。
+
+目前 timeout：
+
+```text
+5 ms
+```
+
+如果超過：
+
+```c
+USB_RESPONSE_TIMEOUT_MS
+```
+
+仍然沒有 Response，STM32 傳送：
+
+```text
+Response Timeout
+```
+
+例如：
+
+```text
+CM5
+ │
+ │ COMMAND seq=1
+ ▼
+STM32
+ │
+ │ waiting = 1
+ │
+ │ 0 ms
+ │
+ │ 1 ms
+ │
+ │ 2 ms
+ │
+ │ 3 ms
+ │
+ │ 4 ms
+ │
+ │ 5 ms
+ ▼
+Response Timeout
+```
+
+Timeout 後：
+
+```c
+usb_response_waiting = 0U;
+```
+
+此次 Response waiting window 結束。
+
+---
+
+# 12. Timeout 後才產生 Response
+
+如果 EtherCAT / Motion Control 在 timeout 之後才產生 Response：
+
+```text
+CM5 Command
+      ↓
+waiting
+      ↓
+5 ms
+      ↓
+Response Timeout
+      ↓
+waiting = 0
+      ↓
+晚到的 Response
+```
+
+此 Response 不應再傳送。
+
+這是本系統刻意採用的設計。
+
+原因是：
+
+* Response timeout 已經通知 CM5。
+* End User 可以重新送 Command。
+* 不需要在 STM32 建立複雜的 late-response / retransmission mechanism。
+* 避免舊 Response 與新 Command 發生關聯錯誤。
+
+---
+
+# 13. Response Retransmission
+
+本 Response path 不實作 retransmission。
+
+原因：
+
+1. Response Command 本身很短。
+2. Response packet 已經有 CRC。
+3. CM5 可以檢查 Response Packet。
+4. 如果 Response 發生問題，CM5 可以通知 TCP Client。
+5. End User 可以重新送 Command。
+6. STM32 不需要維護 Response retransmission state machine。
+
+因此：
+
+```text
+COMMAND path
+    ↓
+可以使用既有 retransmission mechanism
+
+RESPONSE path
+    ↓
+不使用 retransmission mechanism
+```
+
+兩者設計保持分離。
+
+---
+
+# 14. Response Packet 格式
+
+Response 使用既有 USB Packet Protocol。
+
+Header：
+
+```text
+Magic        2 bytes
+Version      1 byte
+Type         1 byte
+Sequence     2 bytes
+Payload Len  2 bytes
+```
+
+Response：
+
+```text
+Type = 0x02
+```
+
+Payload 為 Response Command。
+
+CRC16：
+
+```text
+Polynomial = 0xA001
+Initial    = 0xFFFF
+```
+
+---
+
+# 15. Response 傳輸實驗
+
+本設計已完成 Response 傳輸驗證。
+
+測試 Command：
+
+```text
+MOV R 1000 1000 500 0 0 0
+```
+
+CM5：
+
+```text
+[USB TX] COMMAND seq=1 payload=27 total=37
+```
+
+STM32 收到：
+
+```text
+[USB PKT] COMMAND received, seq=1
+[USB RESP] Waiting for response, seq=1
+```
+
+測試程式在 4 ms 模擬 Response Command：
+
+```text
+DONE
+```
+
+STM32：
+
+```text
+[USB RESP TEST] Response placed into buffer at 4 ms
+[USB RESP TEST] Buffer contains response: DONE
+```
+
+然後傳送：
+
+```text
+[USB PKT TX] RESPONSE seq=1 payload=4 total=14
+```
+
+CM5 收到：
+
+```text
+[USB RX] Packet OK type=0x2 seq=1 payload=4
+[USB RX] Payload HEX: 44 4F 4E 45
+```
+
+代表：
+
+```text
+DONE
+```
+
+已成功由 STM32 傳送至 CM5。
+
+---
+
+# 16. Timeout 實驗
+
+已完成無 Response 的 Timeout 驗證。
+
+測試流程：
+
+```text
+CM5 Command
+    ↓
+STM32 waiting
+    ↓
+Response Buffer 保持空白
+    ↓
+5 ms
+    ↓
+Response Timeout
+```
+
+CM5 可以正常收到：
+
+```text
+Response Timeout
+```
+
+代表 Timeout 機制正常。
+
+---
+
+# 17. 無 Command 實驗
+
+也已驗證：
+
+```text
+STM32 啟動
+    ↓
+沒有 CM5 Command
+    ↓
+usb_response_buffer 為空
+    ↓
+usb_response_waiting = 0
+    ↓
+USB_Packet_ProcessResponseWait()
+    ↓
+return
+```
+
+結果：
+
+```text
+無 USB TX
+無 Response
+無 Timeout
+```
+
+這符合設計。
+
+---
+
+# 18. 初始化
+
+Response state 在 USB CDC 初始化時初始化。
+
+初始化內容包含：
+
+```c
+usb_response_buffer[0] = '\0';
+usb_response_length = 0U;
+usb_response_waiting = 0U;
+usb_response_sequence = 0U;
+usb_response_start_tick = 0U;
+```
+
+因此系統啟動後 Response Buffer 保持空白狀態。
+
+---
+
+# 19. 同事整合範例
+
+假設 EtherCAT / Motion Control 程式最後產生：
+
+```text
+DONE
+```
+
+同事只需要將 Response Command 放入：
+
+```c
+usb_response_buffer
+```
+
+例如：
+
+```c
+const char response_command[] = "DONE";
+
+memcpy(
+    usb_response_buffer,
+    response_command,
+    sizeof(response_command)
+);
+```
+
+之後不需要再呼叫：
+
+```c
+USB_ResponseSubmit();
+```
+
+也不需要呼叫：
+
+```c
+USB_Packet_SendResponse();
+```
+
+USB main loop 會自動處理：
+
+```c
+USB_Packet_ProcessResponseWait();
+```
+
+---
+
+# 20. 整合時的重要注意事項
+
+## 20.1 Response 必須在 timeout 之前準備完成
+
+目前：
+
+```c
+#define USB_RESPONSE_TIMEOUT_MS    5U
+```
+
+因此 EtherCAT / Motion Control 必須在此時間範圍內產生 Response。
+
+---
+
+## 20.2 不要修改 USB internal state
+
+同事端不要直接操作：
+
+```c
+usb_response_waiting
+usb_response_sequence
+usb_response_start_tick
+usb_response_length
+```
+
+這些由 USB module 管理。
+
+同事只負責：
+
+```text
+產生 Response
+      ↓
+copy 到 usb_response_buffer
+```
+
+---
+
+## 20.3 不要直接呼叫 USB Packet Sender
+
+同事不要使用：
+
+```c
+USB_Packet_SendResponse()
+```
+
+Response packet 的封裝、CRC、sequence 與 CDC transmission 都由 USB module 處理。
+
+---
+
+# 21. 最終設計
+
+正式系統中的 USB main loop：
+
+```c
+while (1)
+{
+    USB_Packet_CheckRxTimeout();
+    USB_Packet_ProcessResponseWait();
+}
+```
+
+CM5 Command：
+
+```text
+CM5
+ ↓
+USB COMMAND
+ ↓
+STM32
+ ↓
+waiting = 1
+ ↓
+EtherCAT / Motion Control
+```
+
+Response：
+
+```text
+EtherCAT / Motion Control
+ ↓
+Response Command
+ ↓
+usb_response_buffer
+ ↓
+USB_Packet_ProcessResponseWait()
+ ↓
+USB_Packet_SendResponse()
+ ↓
+USB CDC
+ ↓
+CM5
+```
+
+Timeout：
+
+```text
+CM5 Command
+ ↓
+waiting = 1
+ ↓
+5 ms
+ ↓
+沒有 Response
+ ↓
+Response Timeout
+```
+
+---
+
+# 22. 設計總結
+
+本 USB Response 架構採用最少的整合介面：
+
+```text
+同事端
+    ↓
+只使用
+usb_response_buffer
+```
+
+USB module 負責所有其他工作：
+
+```text
+Command received
+       ↓
+Start timeout
+       ↓
+Wait
+       ↓
+Check response buffer
+       ↓
+Send Response
+       ↓
+Clear buffer
+       ↓
+Finish
+```
+
+主迴圈維持兩個 USB service function：
+
+```c
+USB_Packet_CheckRxTimeout();
+USB_Packet_ProcessResponseWait();
+```
+
+不新增 Response Submit API，不增加 Response retransmission mechanism，也不讓 EtherCAT / Motion Control 程式介入 USB Packet 封裝。
+
+此設計已完成：
+
+* Response Buffer 傳輸測試
+* 4 ms Response 模擬測試
+* Response Packet CRC 驗證
+* CM5 Response 接收驗證
+* Response Buffer 清空驗證
+* 無 Command 狀態驗證
+* 5 ms Timeout 驗證
+
+因此此架構可作為 STM32H755 USB Response 與 EtherCAT / Motion Control 程式後續整合的正式基礎。
+---
