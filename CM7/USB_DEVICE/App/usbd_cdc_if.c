@@ -81,9 +81,9 @@
 
 #define USB_RESPONSE_TIMEOUT_MS       5U    // Response Timeout = 5 ms
 // 測試使用，如果在 5ms 以內送出 Response Command 給 CM5 -- 驗證成功
-//#define USB_RESPONSE_TEST_READY_MS    4U    // 測試 Response = 4 ms
+#define USB_RESPONSE_TEST_READY_MS    4U    // 測試 Response = 4 ms
 
-
+#define USB_COMMAND_BUFFER_SIZE      (USB_PKT_MAX_PAYLOAD + 1U)
 /* USER CODE END PRIVATE_DEFINES */
 
 
@@ -91,6 +91,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 static uint8_t packet_rx_buffer[USB_PKT_MAX_SIZE];
+static char usb_command_buffer[USB_COMMAND_BUFFER_SIZE];
 static uint32_t packet_rx_length = 0U;
 static uint32_t packet_rx_start_tick = 0U;
 static uint16_t packet_rx_sequence = 0U;
@@ -177,8 +178,9 @@ static void USB_Packet_SendResponse(
     uint16_t sequence,
     const char *response_payload);
 
-//static uint8_t USB_ResponseSubmit(const char *response_payload);
-
+static uint8_t USB_ResponseSubmit(const char *response_payload);
+const char *USB_Command_GetBuffer(void);
+void USB_Command_ClearBuffer(void);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -447,6 +449,28 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
+
+// 未來唯一需要知道的入口 API： 韋捷 抓取 Command 的 地方
+const char *USB_Command_GetBuffer(void)
+{
+    return usb_command_buffer;
+}
+
+// 一旦 韋捷 把命令取走，就清空 buffer
+void USB_Command_ClearBuffer(void)
+{
+    usb_command_buffer[0] = '\0';
+}
+
+// 把 Response 傳回 client 端，例如： USB_SendResponse("DONE");
+uint8_t USB_SendResponse(const char *response)
+{
+    return USB_ResponseSubmit(response);
+}
+
+
+
+
 static uint16_t USB_Packet_CalculateCRC16(
     const uint8_t *data,
     uint32_t length)
@@ -643,12 +667,47 @@ static void USB_Packet_SendRetransmitRequest(uint16_t sequence)
     );
 }
 
+/***************************************************************
+ * USB RESPONSE MODE SELECT
+ *
+ * TEST A：
+ * 4 ms → DONE 放進 usb_response_buffer
+ *      → buffer 有資料 → USB_Packet_SendResponse()
+ *
+ * TEST B：
+ * 4 ms → 直接 USB_Packet_SendResponse("DONE")
+ *
+ * TEST C：
+ * 4 ms → USB_ResponseSubmit("DONE")
+ *
+ * TEST D：
+ * 5 ms → Response Timeout
+ *
+ * RELEASE：
+ * 正式版本，不執行任何 Response 測試程式。
+ *
+ * 使用方式：
+ *   測試時只解除其中一套 TEST define。
+ *   正式版本解除 USB_COMMAND_RELEASE。
+ ***************************************************************/
+
+//#define USB_RESPONSE_TEST_A
+//#define USB_RESPONSE_TEST_B
+//#define USB_RESPONSE_TEST_C
+//#define USB_RESPONSE_TEST_D
+#define USB_COMMAND_RELEASE
+#define USB_COMMAND_API_TEST
+
 void USB_Packet_ProcessResponseWait(void)
 {
     if (usb_response_waiting == 0U)
     {
         return;
     }
+
+    #ifdef USB_COMMAND_RELEASE
+        return;
+    #endif
 
     printf("USB_Packet_ProcessResponseWait()\r\n"); // idle status 測試使用
 
@@ -657,188 +716,224 @@ void USB_Packet_ProcessResponseWait(void)
 
 
 
-/*******************  測試使用  ********************************
-// 模擬「同事如何把 Response command 放進 buffer」
-if ((usb_response_waiting != 0U) &&
-    (usb_response_length == 0U) &&
-    (elapsed >= 4U))
-{
-    const char test_response[] = "DONE";
+    #ifdef USB_RESPONSE_TEST_A
 
-    memcpy(
-        usb_response_buffer,
-        test_response,
-        sizeof(test_response)
-    );
+        /******************* TEST A **********************************
+        * 4 ms → DONE 放進 usb_response_buffer
+        *      → buffer 有資料 → USB_Packet_SendResponse()
+        *
+        * 模擬「同事如何把 Response command 放進 buffer」。
+        *************************************************************/
 
-    usb_response_length =
-        (uint16_t)(sizeof(test_response) - 1U);
+        if ((usb_response_waiting != 0U) &&
+            (usb_response_length == 0U) &&
+            (elapsed >= 4U))
+        {
+            const char test_response[] = "DONE";
 
-    printf(
-        "[USB RESP TEST] Response placed into buffer at %lu ms\r\n",
-        elapsed
-    );
-}
-*********************************************************************************/
+            memcpy(
+                usb_response_buffer,
+                test_response,
+                sizeof(test_response)
+            );
+
+            usb_response_length =
+                (uint16_t)(sizeof(test_response) - 1U);
+
+            printf(
+                "[USB RESP TEST A] Response placed into buffer at %lu ms\r\n",
+                elapsed
+            );
+        }
+
+        if (usb_response_length > 0U)
+        {
+            printf(
+                "[USB RESP TEST A] Buffer contains response: %s\r\n",
+                usb_response_buffer
+            );
+
+            USB_Packet_SendResponse(
+                usb_response_sequence,
+                usb_response_buffer
+            );
+
+            usb_response_buffer[0] = '\0';
+            usb_response_length = 0U;
+            usb_response_waiting = 0U;
+
+            printf(
+                "[USB RESP TEST A] Response sent at %lu ms\r\n",
+                elapsed
+            );
+
+            return;
+        }
+
+    #endif
 
 
+    #ifdef USB_RESPONSE_TEST_B
 
-    
-    if (usb_response_length > 0U)
+        /******************* TEST B **********************************
+        * 4 ms → 直接 USB_Packet_SendResponse("DONE")
+        *
+        * 模擬 EtherCAT 已經產生 Response，
+        * 直接送出 Response Packet。
+        *************************************************************/
+
+        if (elapsed >= USB_RESPONSE_TEST_READY_MS)
+        {
+            usb_response_waiting = 0U;
+
+            USB_Packet_SendResponse(
+                usb_response_sequence,
+                "DONE"
+            );
+
+            printf(
+                "[USB RESP TEST B] Direct response DONE at %lu ms\r\n",
+                elapsed
+            );
+
+            return;
+        }
+
+    #endif
+
+
+    #ifdef USB_RESPONSE_TEST_C
+
+        /******************* TEST C **********************************
+        * 4 ms → USB_ResponseSubmit("DONE")
+        *
+        * 模擬同事透過 USB_ResponseSubmit()
+        * 將 EtherCAT Response 交給 USB Response layer。
+        *************************************************************/
+
+        if (elapsed >= USB_RESPONSE_TEST_READY_MS)
+        {
+            USB_ResponseSubmit("DONE");
+
+            printf(
+                "[USB RESP TEST C] USB_ResponseSubmit DONE at %lu ms\r\n",
+                elapsed
+            );
+
+            return;
+        }
+
+    #endif
+
+
+    #ifdef USB_RESPONSE_TEST_D
+
+        /******************* TEST D **********************************
+        * 5 ms → Response Timeout
+        *************************************************************/
+
+        if (elapsed >= USB_RESPONSE_TIMEOUT_MS)
+        {
+            usb_response_waiting = 0U;
+
+            USB_Packet_SendResponse(
+                usb_response_sequence,
+                "Response Timeout"
+            );
+
+            printf(
+                "[USB RESP TEST D] Response TIMEOUT at %lu ms\r\n",
+                elapsed
+            );
+
+            return;
+        }
+
+    #endif
+    }
+
+
+    /***************************************************************
+    * USB RESPONSE SUBMIT
+    *
+    * 提供同事的 EtherCAT / Motion Control 程式
+    * 將 Response command 交給 USB Response layer。
+    ***************************************************************/
+    static uint8_t USB_ResponseSubmit(
+        const char *response_payload)
     {
-        printf(
-            "[USB RESP TEST] Buffer contains response: %s\r\n",
-            usb_response_buffer
+        if (response_payload == NULL)
+        {
+            return 0U;
+        }
+
+        if (usb_response_waiting == 0U)
+        {
+            printf(
+                "[USB RESP] Response rejected: timeout\r\n"
+            );
+
+            return 0U;
+        }
+
+        const uint32_t elapsed =
+            HAL_GetTick() - usb_response_start_tick;
+
+        if (elapsed >= USB_RESPONSE_TIMEOUT_MS)
+        {
+            usb_response_waiting = 0U;
+
+            printf(
+                "[USB RESP] Response rejected: timeout at %lu ms\r\n",
+                elapsed
+            );
+
+            return 0U;
+        }
+
+        const size_t response_length =
+            strlen(response_payload);
+
+        if (response_length == 0U)
+        {
+            return 0U;
+        }
+
+        if (response_length >= USB_RESPONSE_MAX_LENGTH)
+        {
+            printf(
+                "[USB RESP] Response rejected: too long\r\n"
+            );
+
+            return 0U;
+        }
+
+        memcpy(
+            usb_response_buffer,
+            response_payload,
+            response_length + 1U
         );
+
+        usb_response_length =
+            (uint16_t)response_length;
 
         USB_Packet_SendResponse(
             usb_response_sequence,
             usb_response_buffer
         );
 
-        usb_response_buffer[0] = '\0';
-        usb_response_length = 0U;
         usb_response_waiting = 0U;
 
         printf(
-            "[USB RESP] Response sent at %lu ms\r\n",
-            elapsed
+            "[USB RESP] Response submitted at %lu ms, length=%u\r\n",
+            elapsed,
+            usb_response_length
         );
 
-        return;
-    }
-    
-    /*
-     * Test:
-     * Simulate EtherCAT response at 4 ms.
-     * 測試使用，如果在 5ms 以內送出 Response Command 給 CM5 -- 驗證成功
-     */
-    /*
-    if (elapsed >= USB_RESPONSE_TEST_READY_MS)
-    {
-        usb_response_waiting = 0U;
-
-        // 這是測試使用固定的 Response Command "DONE"
-        USB_Packet_SendResponse(
-            usb_response_sequence,
-            "DONE"
-        );
-
-        printf(
-            "[USB RESP] Test response DONE after at %lu ms\r\n",
-            elapsed
-        );
-
-        return;
-    }
-    */
-    /*
-     * Test:
-     * Simulate EtherCAT response at 4 ms.
-     */
-    /*
-    if (elapsed >= USB_RESPONSE_TEST_READY_MS)
-    {
-        USB_ResponseSubmit("DONE");
-
-        printf(
-            "[USB RESP TEST] Simulated EtherCAT response at %lu ms\r\n",
-            elapsed
-        );
-
-        return;
-    }
-    */
-
-    if (elapsed >= USB_RESPONSE_TIMEOUT_MS)
-    {
-        usb_response_waiting = 0U;
-
-        USB_Packet_SendResponse(
-            usb_response_sequence,
-            "Response Timeout"
-        );
-
-        printf(
-            "[USB RESP] Response TIMEOUT at %lu ms\r\n",
-            elapsed
-        );
-
-        return;
-    }
-}
-
-/* 
-static uint8_t USB_ResponseSubmit(
-    const char *response_payload)
-{
-    if (response_payload == NULL)
-    {
-        return 0U;
+        return 1U;
     }
 
-    if (usb_response_waiting == 0U)
-    {
-        printf("[USB RESP] Response rejected: timeout\r\n");
-        return 0U;
-    }
-
-    const uint32_t elapsed =
-        HAL_GetTick() - usb_response_start_tick;
-
-    if (elapsed >= USB_RESPONSE_TIMEOUT_MS)
-    {
-        usb_response_waiting = 0U;
-
-        printf(
-            "[USB RESP] Response rejected: timeout at %lu ms\r\n",
-            elapsed
-        );
-
-        return 0U;
-    }
-
-    const size_t response_length =
-        strlen(response_payload);
-
-    if (response_length == 0U)
-    {
-        return 0U;
-    }
-
-    if (response_length >= USB_RESPONSE_MAX_LENGTH)
-    {
-        printf(
-            "[USB RESP] Response rejected: too long\r\n"
-        );
-
-        return 0U;
-    }
-
-    memcpy(
-        usb_response_buffer,
-        response_payload,
-        response_length + 1U
-    );
-
-    usb_response_length = (uint16_t)response_length;
-
-    USB_Packet_SendResponse(
-        usb_response_sequence,
-        usb_response_buffer
-    );
-
-    usb_response_waiting = 0U;
-
-    printf(
-        "[USB RESP] Response submitted at %lu ms, length=%u\r\n",
-        elapsed,
-        usb_response_length
-    );
-
-    return 1U;
-}
-*/
+/**************************************************************** */
 
 static void USB_Packet_ProcessRx(void)
 {
@@ -1163,6 +1258,20 @@ static void USB_Packet_ProcessRx(void)
 
             printf("\r\n");
 
+            memcpy(
+                usb_command_buffer,
+                &packet_rx_buffer[USB_PKT_HEADER_SIZE],
+                payload_length
+            );
+
+            usb_command_buffer[payload_length] = '\0';
+
+            printf(
+                "[USB CMD] Command buffer updated, length=%u\r\n",
+                payload_length
+            );
+
+
             usb_response_buffer[0] = '\0';
             usb_response_length = 0U;
 
@@ -1198,6 +1307,25 @@ static void USB_Packet_ProcessRx(void)
 void USB_Packet_CheckRxTimeout(void)
 {
     const uint32_t now = HAL_GetTick();
+
+#ifdef USB_COMMAND_API_TEST
+
+    /* USB COMMAND API TEST */
+    const char *command = USB_Command_GetBuffer();
+
+    if (command[0] != '\0')
+    {
+        printf(
+            "[USB APP] Command: %s\r\n",
+            command
+        );
+
+        USB_SendResponse("DONE");
+
+        USB_Command_ClearBuffer();
+    }
+
+#endif
 
     /* STEP 3:
      * Waiting for the one allowed retransmission.

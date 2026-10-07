@@ -92,7 +92,7 @@
 
 /** CDC Interface callback. */
 extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
-extern char usb_response_buffer[USB_RESPONSE_MAX_LENGTH];
+//extern char usb_response_buffer[USB_RESPONSE_MAX_LENGTH];
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
 
@@ -112,6 +112,9 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
 /* USER CODE BEGIN EXPORTED_FUNCTIONS */
 void USB_Packet_CheckRxTimeout(void);
 void USB_Packet_ProcessResponseWait(void);
+const char *USB_Command_GetBuffer(void);
+void USB_Command_ClearBuffer(void);
+uint8_t USB_SendResponse(const char *response);
 /* USER CODE END EXPORTED_FUNCTIONS */
 
 /**
