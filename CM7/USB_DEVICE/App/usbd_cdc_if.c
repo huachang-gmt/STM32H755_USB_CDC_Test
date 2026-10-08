@@ -695,7 +695,8 @@ static void USB_Packet_SendRetransmitRequest(uint16_t sequence)
 //#define USB_RESPONSE_TEST_B
 //#define USB_RESPONSE_TEST_C
 //#define USB_RESPONSE_TEST_D
-#define USB_COMMAND_RELEASE
+
+    
 #define USB_COMMAND_API_TEST
 
 void USB_Packet_ProcessResponseWait(void)
@@ -705,11 +706,6 @@ void USB_Packet_ProcessResponseWait(void)
         return;
     }
 
-    #ifdef USB_COMMAND_RELEASE
-        return;
-    #endif
-
-    printf("USB_Packet_ProcessResponseWait()\r\n"); // idle status 測試使用
 
     const uint32_t elapsed =
         HAL_GetTick() - usb_response_start_tick;
@@ -771,6 +767,31 @@ void USB_Packet_ProcessResponseWait(void)
         }
 
     #endif
+
+
+
+
+#ifdef USB_COMMAND_API_TEST
+
+    /* USB COMMAND API TEST */
+    const char *command = USB_Command_GetBuffer();//接收命令入口
+
+    if (command[0] != '\0')
+    {
+        printf(
+            "[USB APP] Command: %s\r\n",
+            command
+        );
+
+        USB_SendResponse("DONE"); // 回覆入口
+
+        USB_Command_ClearBuffer();
+    }
+
+#endif
+
+
+
 
 
     #ifdef USB_RESPONSE_TEST_B
@@ -850,7 +871,7 @@ void USB_Packet_ProcessResponseWait(void)
         }
 
     #endif
-    }
+}
 
 
     /***************************************************************
@@ -867,6 +888,7 @@ void USB_Packet_ProcessResponseWait(void)
             return 0U;
         }
 
+        // 確認目前是否有一筆尚未完成的 command/response transaction
         if (usb_response_waiting == 0U)
         {
             printf(
@@ -879,6 +901,7 @@ void USB_Packet_ProcessResponseWait(void)
         const uint32_t elapsed =
             HAL_GetTick() - usb_response_start_tick;
 
+        /*  先拿掉「5 ms 內必須回覆」的限制；未來如果有明確需求，再重新加入 timeout 機制
         if (elapsed >= USB_RESPONSE_TIMEOUT_MS)
         {
             usb_response_waiting = 0U;
@@ -890,6 +913,7 @@ void USB_Packet_ProcessResponseWait(void)
 
             return 0U;
         }
+        */
 
         const size_t response_length =
             strlen(response_payload);
@@ -1307,25 +1331,6 @@ static void USB_Packet_ProcessRx(void)
 void USB_Packet_CheckRxTimeout(void)
 {
     const uint32_t now = HAL_GetTick();
-
-#ifdef USB_COMMAND_API_TEST
-
-    /* USB COMMAND API TEST */
-    const char *command = USB_Command_GetBuffer();
-
-    if (command[0] != '\0')
-    {
-        printf(
-            "[USB APP] Command: %s\r\n",
-            command
-        );
-
-        USB_SendResponse("DONE");
-
-        USB_Command_ClearBuffer();
-    }
-
-#endif
 
     /* STEP 3:
      * Waiting for the one allowed retransmission.
